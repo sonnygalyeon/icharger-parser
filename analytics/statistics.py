@@ -1,27 +1,30 @@
 """
 analytics/statistics.py
 
-Расчет статистики по данным телеметрии.
-
-Этот модуль не знает ничего о формате логов.
-Он получает готовый pandas.DataFrame.
-
-Автор: iCharger Analyzer
+Расчёт статистики по данным телеметрии.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import pandas as pd
 
 
+# ==========================================================
+# Модель статистики
+# ==========================================================
+
+
 @dataclass(slots=True)
 class Statistics:
-    duration_seconds: float
+    """
+    Итоговая статистика теста.
+    """
 
     samples: int
+
+    duration_s: float
 
     min_voltage: float
     max_voltage: float
@@ -31,110 +34,97 @@ class Statistics:
     max_current: float
     avg_current: float
 
-    min_power: float
     max_power: float
     avg_power: float
 
-    min_temperature: float
     max_temperature: float
     avg_temperature: float
 
-    total_capacity: float
-    total_energy: float
+    max_cell_delta: float
 
-    max_cell_delta: float | None
-    avg_cell_delta: float | None
+    capacity: float
 
-    average_cell_voltage: float | None
-
-    max_cell_voltage: float | None
-    min_cell_voltage: float | None
+    energy: float
 
 
-class StatisticsEngine:
+# ==========================================================
+# Расчёт статистики
+# ==========================================================
+
+
+class StatisticsCalculator:
 
     """
-    Расчет общей статистики.
+    Расчёт общей статистики.
     """
 
     def calculate(
         self,
-        df: pd.DataFrame
+        df: pd.DataFrame,
     ) -> Statistics:
 
         if df.empty:
-            raise ValueError("DataFrame пуст.")
-
-        duration = (
-            df.index.max()
-            - df.index.min()
-        )
+            raise ValueError(
+                "DataFrame пуст."
+            )
 
         return Statistics(
 
-            duration_seconds=float(duration),
-
             samples=len(df),
 
-            min_voltage=df["voltage"].min(),
-            max_voltage=df["voltage"].max(),
-            avg_voltage=df["voltage"].mean(),
+            duration_s=float(
+                df["time_s"].iloc[-1]
+            ),
 
-            min_current=df["current"].min(),
-            max_current=df["current"].max(),
-            avg_current=df["current"].mean(),
+            min_voltage=float(
+                df["voltage"].min()
+            ),
 
-            min_power=df["power"].min(),
-            max_power=df["power"].max(),
-            avg_power=df["power"].mean(),
+            max_voltage=float(
+                df["voltage"].max()
+            ),
 
-            min_temperature=df["temperature"].min(),
-            max_temperature=df["temperature"].max(),
-            avg_temperature=df["temperature"].mean(),
+            avg_voltage=float(
+                df["voltage"].mean()
+            ),
 
-            total_capacity=df["capacity"].max(),
-            total_energy=df["energy"].max(),
+            min_current=float(
+                df["current"].min()
+            ),
 
-            max_cell_delta=(
+            max_current=float(
+                df["current"].max()
+            ),
+
+            avg_current=float(
+                df["current"].mean()
+            ),
+
+            max_power=float(
+                df["power"].max()
+            ),
+
+            avg_power=float(
+                df["power"].mean()
+            ),
+
+            max_temperature=float(
+                df["temperature"].max()
+            ),
+
+            avg_temperature=float(
+                df["temperature"].mean()
+            ),
+
+            max_cell_delta=float(
                 df["cell_delta"].max()
-                if "cell_delta" in df
-                else None
             ),
 
-            avg_cell_delta=(
-                df["cell_delta"].mean()
-                if "cell_delta" in df
-                else None
+            capacity=float(
+                df["capacity"].max()
             ),
 
-            average_cell_voltage=(
-                (
-                    df["max_cell"]
-                    + df["min_cell"]
-                ).mean() / 2
-                if (
-                    "max_cell" in df
-                    and "min_cell" in df
-                )
-                else None
-            ),
-
-            max_cell_voltage=(
-                df["max_cell"].max()
-                if "max_cell" in df
-                else None
-            ),
-
-            min_cell_voltage=(
-                df["min_cell"].min()
-                if "min_cell" in df
-                else None
+            energy=float(
+                df["energy"].max()
             ),
         )
-
-    @staticmethod
-    def to_dict(
-        stats: Statistics
-    ) -> dict[str, Any]:
-
-        return stats.__dict__

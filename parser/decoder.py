@@ -1,91 +1,252 @@
 """
-decoder.py
+parser/decoder.py
 
 Декодирование строк логов iCharger.
 
-Этот модуль НЕ читает файл.
+Автор: iCharger Analyzer
 
-Он получает одну строку
-
-$1;2;1000;...
-
-и превращает её в объект Python.
-
-Все остальные части проекта работают уже с объектами,
-а не со строками.
+Назначение:
+    • разбор строк телеметрии;
+    • преобразование строк в объекты моделей;
+    • валидация количества полей;
+    • безопасное преобразование типов.
 """
 
 from __future__ import annotations
 
-from abc import ABC
-from typing import Callable
-from typing import Dict
+from typing import List
 
 from .models import (
-    EventRecord,
+    Header,
     TelemetryRecord,
+    StatusRecord,
 )
 
-# ============================================================
+
+# ==========================================================
 # Исключения
-# ============================================================
+# ==========================================================
 
 
 class DecodeError(Exception):
-    """Ошибка декодирования строки."""
+    """Базовое исключение декодера."""
 
 
-# ============================================================
-# Базовый пакет
-# ============================================================
+class InvalidPacketError(DecodeError):
+    """Некорректный пакет."""
 
 
-class Packet(ABC):
+class UnsupportedPacketError(DecodeError):
+    """Тип пакета не поддерживается."""
+
+
+# ==========================================================
+# Константы
+# ==========================================================
+
+PACKET_TELEMETRY = 2
+PACKET_STATUS = 128
+
+EXPECTED_PACKET2_FIELDS = 22
+MIN_PACKET128_FIELDS = 5
+
+
+# ==========================================================
+# Вспомогательные функции
+# ==========================================================
+
+
+def _safe_int(value: str) -> int:
     """
-    Абстрактный пакет.
-
-    Все типы пакетов наследуются от него.
+    Безопасное преобразование строки в int.
     """
 
-    pass
+    try:
+        return int(value)
+
+    except ValueError as exc:
+        raise InvalidPacketError(
+            f"Невозможно преобразовать '{value}' в int."
+        ) from exc
 
 
-# ============================================================
-# Регистрация декодеров
-# ============================================================
-
-
-Decoder = Callable[[list[str]], Packet]
-
-_DECODERS: Dict[int, Decoder] = {}
-
-
-def register(packet_id: int):
+def _split_packet(line: str) -> List[str]:
     """
-    Декоратор регистрации декодера.
+    Разбивает строку пакета на поля.
 
     Пример:
 
-    @register(2)
-    def decode(...):
-        ...
+        $1;2;370000;...
+
+    ->
+        ["1","2","370000",...]
     """
 
-    def wrapper(func: Decoder):
-        _DECODERS[packet_id] = func
-        return func
+    line = line.strip()
 
-    return wrapper
+    if not line:
+        raise InvalidPacketError("Пустая строка.")
+
+    if not line.startswith("$"):
+        raise InvalidPacketError(
+            "Строка не начинается с '$'."
+        )
+
+    line = line[1:]
+
+    parts = [part.strip() for part in line.split(";")]
+
+    if len(parts) < 2:
+        raise InvalidPacketError(
+            "Недостаточно полей."
+        )
+
+    return parts
 
 
-# ============================================================
-# Главная функция
-# ============================================================
-
-
-def decode_line(line: str) -> Packet | None:
+def _parse_cells(values: List[int]) -> list[int]:
     """
-    Декодировать одну строку.
+    Возвращает только реально существующие банки.
+
+    Нулевые значения отбрасываются.
+    """
+
+    return [cell for cell in values if cell > 0]
+
+
+# ==========================================================
+# Packet Type = 2
+# ==========================================================
+
+
+def _decode_packet2(parts: List[str]) -> TelemetryRecord:
+    """
+    Декодирование пакета телеметрии.
+
+    Формат:
+
+    $1;2;
+    timestamp;
+    mode;
+    flags;
+    current;
+    voltage;
+    capacity;
+    energy;
+    temperature;
+    reserved;
+    cell1;
+    cell2;
+    cell3;
+    cell4;
+    cell5;
+    cell6;
+    cell7;
+    cell8;
+    cell9;
+    cell10;
+    checksum
+    """
+
+    if len(parts) != EXPECTED_PACKET2_FIELDS:
+        raise InvalidPacketError(
+            f"Packet2: ожидалось "
+            f"{EXPECTED_PACKET2_FIELDS} полей, "
+            f"получено {len(parts)}."
+        )
+
+    values = [_safe_int(v) for v in parts]
+
+    channel = values[0]
+    packet_type = values[1]
+
+    timestamp = values[2]
+
+    mode = values[3]
+    flags = values[4]
+
+    current = values[5]
+    voltage = values[6]
+
+    capacity = values[7]
+    energy = values[8]
+
+    temperature = values[9]
+
+    reserved = values[10]
+
+    cells = _parse_cells(
+        values[11:21]
+    )
+
+    checksum = values[21]
+
+    return TelemetryRecord(
+        channel=channel,
+        packet_type=packet_type,
+        timestamp_ms=timestamp,
+        mode=mode,
+        flags=flags,
+        current_raw=current,
+        voltage_raw=voltage,
+        capacity_raw=capacity,
+        energy_raw=energy,
+        temperature_raw=temperature,
+        reserved_raw=reserved,
+        cells_raw=cells,
+        checksum=checksum,
+    )
+
+# ==========================================================
+# Packet Type = 128
+# ==========================================================
+
+
+def _decode_packet128(parts: List[str]) -> StatusRecord:
+    """
+    Декодирование служебного пакета (Packet Type = 128).
+
+    Формат пакета пока полностью не документирован,
+    поэтому неизвестные поля сохраняются в raw_values.
+    """
+
+    if len(parts) < MIN_PACKET128_FIELDS:
+        raise InvalidPacketError(
+            f"Packet128: недостаточно полей ({len(parts)})."
+        )
+
+    values = [_safe_int(value) for value in parts]
+
+    channel = values[0]
+    packet_type = values[1]
+    timestamp = values[2]
+
+    payload = values[3:]
+
+    return StatusRecord(
+        channel=channel,
+        packet_type=packet_type,
+        timestamp_ms=timestamp,
+        raw_values=payload,
+    )
+
+
+# ==========================================================
+# Header
+# ==========================================================
+
+
+def decode_header(line: str) -> Header | None:
+    """
+    Декодирует строку заголовка.
+
+    Поддерживаются форматы:
+
+        Firmware=2.20
+
+        Firmware : 2.20
+
+        Firmware= 2.20
     """
 
     line = line.strip()
@@ -93,111 +254,96 @@ def decode_line(line: str) -> Packet | None:
     if not line:
         return None
 
-    if not line.startswith("$"):
+    if line.startswith("$"):
         return None
 
-    parts = line.split(";")
+    separator = None
+
+    if "=" in line:
+        separator = "="
+
+    elif ":" in line:
+        separator = ":"
+
+    if separator is None:
+        return None
+
+    key, value = line.split(separator, 1)
+
+    key = key.strip()
+    value = value.strip()
+
+    if not key:
+        return None
+
+    return Header(
+        key=key,
+        value=value,
+    )
+
+
+# ==========================================================
+# Packet Detection
+# ==========================================================
+
+
+def _packet_type(parts: List[str]) -> int:
+    """
+    Возвращает тип пакета.
+    """
 
     if len(parts) < 2:
-        raise DecodeError("Некорректная строка.")
-
-    try:
-        packet_type = int(parts[1])
-
-    except ValueError:
-        raise DecodeError("Не удалось определить тип пакета.")
-
-    decoder = _DECODERS.get(packet_type)
-
-    if decoder is None:
-        raise DecodeError(
-            f"Неизвестный пакет {packet_type}"
+        raise InvalidPacketError(
+            "Не удалось определить тип пакета."
         )
 
-    return decoder(parts)
+    return _safe_int(parts[1])
 
-@register(2)
-def decode_telemetry(parts: list[str]) -> TelemetryRecord:
+
+# ==========================================================
+# Public Decoder
+# ==========================================================
+
+
+def decode_line(line: str):
     """
-    Телеметрический пакет.
+    Декодирует одну строку лога.
 
-    $1;2;....
+    Возвращает один из объектов:
+
+        TelemetryRecord
+        StatusRecord
+
+    Исключения:
+
+        DecodeError
+        InvalidPacketError
+        UnsupportedPacketError
     """
 
-    try:
+    parts = _split_packet(line)
 
-        timestamp = int(parts[2])
+    packet_type = _packet_type(parts)
 
-        current = float(parts[5]) / 100.0
+    if packet_type == PACKET_TELEMETRY:
+        return _decode_packet2(parts)
 
-        voltage = float(parts[6]) / 1000.0
+    if packet_type == PACKET_STATUS:
+        return _decode_packet128(parts)
 
-        power = voltage * current
-
-        capacity = float(parts[7])
-
-        temperature = float(parts[9])
-
-    except (ValueError, IndexError):
-
-        raise DecodeError(
-            "Ошибка чтения пакета телеметрии."
-        )
-
-    return TelemetryRecord(
-
-        timestamp_ms=timestamp,
-
-        voltage=voltage,
-
-        current=current,
-
-        power=power,
-
-        capacity=capacity,
-
-        energy=0.0,
-
-        temperature=temperature,
-
-        internal_resistance=None,
-
-        cell_voltages=[],
-
-        balancing=False,
-
-        raw=[
-            int(x) if x.lstrip("-").isdigit() else 0
-            for x in parts[2:]
-        ],
+    raise UnsupportedPacketError(
+        f"Неподдерживаемый тип пакета: {packet_type}"
     )
 
-@register(128)
-def decode_packet128(parts: list[str]) -> EventRecord:
-    """
-    Служебный пакет.
 
-    Пока сохраняем как событие.
+# ==========================================================
+# Public API
+# ==========================================================
 
-    После изучения остальных логов
-    можно будет заменить отдельным классом.
-    """
-
-    timestamp = int(parts[2])
-
-    return EventRecord(
-
-        timestamp_ms=timestamp,
-
-        event="PACKET128",
-
-        description="Service packet",
-
-    )
-
-def available_packets() -> list[int]:
-    """
-    Вернуть список поддерживаемых пакетов.
-    """
-
-    return sorted(_DECODERS.keys())
+__all__ = [
+    "DecodeError",
+    "InvalidPacketError",
+    "UnsupportedPacketError",
+    "decode_line",
+    "decode_header",
+]
