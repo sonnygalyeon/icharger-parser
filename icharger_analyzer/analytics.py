@@ -18,6 +18,13 @@ class AnalysisSummary:
     samples: int
     duration_s: float
     median_sample_interval_s: float
+    mean_sample_interval_s: float
+    min_sample_interval_s: float
+    max_sample_interval_s: float
+    sample_interval_std_s: float
+    nominal_sample_rate_hz: float
+    telemetry_gap_count: int
+    max_telemetry_gap_s: float
     detected_cells: int
     start_pack_voltage_v: float
     end_pack_voltage_v: float
@@ -64,6 +71,14 @@ class AnalysisResult:
     warnings: list[AnalysisWarning]
 
 
+def _format_elapsed_time(seconds: float) -> str:
+    total_ms = max(0, int(round(float(seconds) * 1000.0)))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
 def build_telemetry_frame(log: ChargerLog) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for sample, record in enumerate(log.telemetry):
@@ -88,7 +103,10 @@ def build_telemetry_frame(log: ChargerLog) -> pd.DataFrame:
     frame["time_s"] = (frame["timestamp_ms"] - start_ms) / 1000.0
     frame["time_min"] = frame["time_s"] / 60.0
     frame["time_h"] = frame["time_s"] / 3600.0
+    frame["elapsed_time"] = frame["time_s"].map(_format_elapsed_time)
     frame["dt_s"] = frame["time_s"].diff().fillna(0.0).clip(lower=0.0)
+    frame["sample_interval_s"] = frame["dt_s"]
+    frame["sample_rate_hz"] = 1.0 / frame["dt_s"].where(frame["dt_s"] > 0)
 
     frame["power_w"] = frame["pack_voltage_v"] * frame["current_a"]
     frame["abs_power_w"] = frame["power_w"].abs()
@@ -187,6 +205,19 @@ def calculate_summary(log: ChargerLog, telemetry: pd.DataFrame, status: pd.DataF
     positive_current = telemetry.loc[telemetry["current_a"] > 0, "current_a"]
     negative_current = telemetry.loc[telemetry["current_a"] < 0, "current_a"]
     dt_positive = telemetry.loc[telemetry["dt_s"] > 0, "dt_s"]
+    if dt_positive.empty:
+        median_dt = mean_dt = min_dt = max_dt = std_dt = sample_rate_hz = 0.0
+        gap_limit = np.inf
+        gap_count = 0
+    else:
+        median_dt = float(dt_positive.median())
+        mean_dt = float(dt_positive.mean())
+        min_dt = float(dt_positive.min())
+        max_dt = float(dt_positive.max())
+        std_dt = float(dt_positive.std(ddof=0))
+        sample_rate_hz = 1.0 / median_dt if median_dt > 0 else 0.0
+        gap_limit = max(median_dt * 2.5, median_dt + 2.0)
+        gap_count = int((dt_positive > gap_limit).sum())
 
     min_cell = telemetry[cells].min().min() if cells else np.nan
     max_cell = telemetry[cells].max().max() if cells else np.nan
@@ -196,7 +227,14 @@ def calculate_summary(log: ChargerLog, telemetry: pd.DataFrame, status: pd.DataF
     return AnalysisSummary(
         samples=len(telemetry),
         duration_s=float(telemetry["time_s"].iloc[-1]),
-        median_sample_interval_s=float(dt_positive.median()) if not dt_positive.empty else 0.0,
+        median_sample_interval_s=median_dt,
+        mean_sample_interval_s=mean_dt,
+        min_sample_interval_s=min_dt,
+        max_sample_interval_s=max_dt,
+        sample_interval_std_s=std_dt,
+        nominal_sample_rate_hz=sample_rate_hz,
+        telemetry_gap_count=gap_count,
+        max_telemetry_gap_s=max_dt,
         detected_cells=len(cells),
         start_pack_voltage_v=float(telemetry["pack_voltage_v"].iloc[0]),
         end_pack_voltage_v=float(telemetry["pack_voltage_v"].iloc[-1]),

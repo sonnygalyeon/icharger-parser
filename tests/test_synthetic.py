@@ -21,3 +21,24 @@ def test_decode_packet_and_skip_broken_line(tmp_path: Path) -> None:
     assert result.telemetry.loc[0, "current_a"] == -5.0
     assert result.telemetry.loc[0, "pack_voltage_v"] == 21.0
     assert result.summary.detected_cells == 5
+
+
+def test_time_columns_and_sampling_summary(tmp_path: Path) -> None:
+    sample = tmp_path / "timing.txt"
+    sample.write_text(
+        "@Model:4010DUO; Fireware:V2.20; Hardware:V2.00; SN:ABC\n"
+        "$1;2;0;1;0;-100;12000;4200;0;250;0;4200;0;0;0;0;0;0;0;0;0;1\n"
+        "$1;2;1000;1;0;-100;12000;4190;-1;250;0;4190;0;0;0;0;0;0;0;0;0;1\n"
+        "$1;2;2000;1;0;-100;12000;4180;-2;250;0;4180;0;0;0;0;0;0;0;0;0;1\n",
+        encoding="utf-8",
+    )
+    result = analyze_log(IChargerParser().parse(sample))
+    assert result.telemetry["elapsed_time"].tolist() == [
+        "00:00:00.000",
+        "00:00:01.000",
+        "00:00:02.000",
+    ]
+    assert result.telemetry["dt_s"].tolist() == [0.0, 1.0, 1.0]
+    assert result.summary.median_sample_interval_s == 1.0
+    assert result.summary.nominal_sample_rate_hz == 1.0
+    assert result.summary.telemetry_gap_count == 0

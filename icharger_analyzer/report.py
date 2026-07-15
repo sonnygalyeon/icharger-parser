@@ -91,6 +91,9 @@ def write_report(
     kpis = [
         ("Длительность", _duration(summary.duration_s)),
         ("Отсчёты", f"{summary.samples:,}".replace(",", " ")),
+        ("Период записи", _fmt(summary.median_sample_interval_s, 3, " s")),
+        ("Частота записи", _fmt(summary.nominal_sample_rate_hz, 3, " Hz")),
+        ("Разрывы телеметрии", str(summary.telemetry_gap_count)),
         ("Банки", str(summary.detected_cells)),
         ("Ёмкость по счётчику", _fmt(summary.capacity_counter_ah, 3, " Ah")),
         ("Интеграл тока", _fmt(summary.integrated_capacity_ah, 3, " Ah")),
@@ -117,6 +120,12 @@ def write_report(
         "Канал": str(log.telemetry[0].channel),
         "Код типа батареи": str(log.telemetry[0].battery_type_code),
         "Медианный период": f"{summary.median_sample_interval_s:.3f} s",
+        "Средний период": f"{summary.mean_sample_interval_s:.3f} s",
+        "Минимальный период": f"{summary.min_sample_interval_s:.3f} s",
+        "Максимальный период / разрыв": f"{summary.max_sample_interval_s:.3f} s",
+        "СКО периода": f"{summary.sample_interval_std_s:.3f} s",
+        "Номинальная частота": f"{summary.nominal_sample_rate_hz:.3f} Hz",
+        "Обнаружено разрывов": str(summary.telemetry_gap_count),
         "Пакетов 128": str(summary.status_record_count),
     }
     metadata_rows = "".join(
@@ -168,6 +177,7 @@ pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:#0f172a; padding
 <section class="card">
 <h2>Параметры лога</h2>
 <div class="table-wrap"><table>{metadata_rows}</table></div>
+<p class="note">Каждый исходный отсчёт сохраняется в CSV с абсолютным счётчиком <code>timestamp_ms</code>, временем от начала <code>elapsed_time</code>, периодом <code>dt_s</code> и мгновенной частотой <code>sample_rate_hz</code>. Последний ряд временного графика показывает стабильность записи и разрывы.</p>
 <p class="note">Поля пакета 128 не опубликованы производителем. Внутреннее сопротивление показано по структуре ваших файлов и проверке суммы банков; исходные значения не теряются в парсере.</p>
 </section>
 <section class="card graph">{''.join(graph_html)}</section>
@@ -189,17 +199,25 @@ pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:#0f172a; padding
 
 def write_comparison_report(
     rows: list[dict[str, object]],
-    figure: go.Figure,
+    figures: list[tuple[str, str, go.Figure]],
     output_file: Path,
     *,
+    comparison_step_s: float,
     standalone: bool = True,
 ) -> None:
+    """Write the final multi-log dashboard with several overlaid figures."""
+
     output_file.parent.mkdir(parents=True, exist_ok=True)
     table_rows = "".join(
         "<tr>"
         f"<td><a href=\"{html.escape(str(row['report']))}\">{html.escape(str(row['file']))}</a></td>"
         f"<td>{html.escape(str(row['cells']))}</td>"
         f"<td>{float(row['duration_h']):.2f}</td>"
+        f"<td>{float(row['samples']):.0f}</td>"
+        f"<td>{float(row['median_interval_s']):.3f}</td>"
+        f"<td>{float(row['min_interval_s']):.3f}</td>"
+        f"<td>{float(row['max_interval_s']):.3f}</td>"
+        f"<td>{int(row['gap_count'])}</td>"
         f"<td>{float(row['capacity_ah']):.3f}</td>"
         f"<td>{float(row['energy_wh']):.2f}</td>"
         f"<td>{float(row['end_voltage_v']):.3f}</td>"
@@ -207,9 +225,54 @@ def write_comparison_report(
         "</tr>"
         for row in rows
     )
-    graph = _figure_html(figure, include_plotlyjs=True if standalone else "cdn")
-    output_file.write_text(
-        f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>iCharger — сравнение</title><style>
-body{{margin:0;background:#0b1220;color:#e5e7eb;font-family:Segoe UI,Arial,sans-serif}}main{{width:min(1600px,96vw);margin:auto;padding:30px 0 60px}}section{{background:#111827;border:1px solid #1e293b;border-radius:16px;padding:20px;margin-top:20px;overflow:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #334155;text-align:left}}a{{color:#38bdf8}}</style></head><body><main><h1>Сравнение логов iCharger</h1><section><table><thead><tr><th>Файл</th><th>Банки</th><th>Часы</th><th>Ah</th><th>Wh</th><th>Конец, V</th><th>Min cell</th></tr></thead><tbody>{table_rows}</tbody></table></section><section>{graph}</section></main></body></html>""",
-        encoding="utf-8",
-    )
+
+    figure_html: list[str] = []
+    include_js: bool | str = True if standalone else "cdn"
+    for index, (title, description, figure) in enumerate(figures):
+        graph = _figure_html(figure, include_plotlyjs=include_js if index == 0 else False)
+        figure_html.append(
+            f'<section class="card graph"><h2>{html.escape(title)}</h2>'
+            f'<p class="muted">{html.escape(description)}</p>{graph}</section>'
+        )
+
+    document = f"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>iCharger — общее сравнение</title>
+<style>
+:root {{ color-scheme:dark; --bg:#0b1220; --card:#111827; --line:#334155; --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,Segoe UI,Arial,sans-serif; }}
+main {{ width:min(1800px,97vw); margin:auto; padding:30px 0 70px; }}
+h1 {{ margin:0 0 8px; font-size:clamp(28px,4vw,46px); }}
+h2 {{ margin:0 0 8px; }}
+a {{ color:var(--accent); }}
+.muted {{ color:var(--muted); }}
+.card {{ background:var(--card); border:1px solid #1e293b; border-radius:16px; padding:20px; margin-top:20px; box-shadow:0 14px 40px rgba(0,0,0,.2); }}
+.note {{ border-left:4px solid var(--accent); padding:11px 14px; background:#0f172a; color:#cbd5e1; }}
+.table-wrap {{ overflow:auto; }}
+table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
+th,td {{ padding:10px; border-bottom:1px solid var(--line); text-align:left; }}
+th {{ position:sticky; top:0; background:#111827; color:#cbd5e1; }}
+.graph {{ overflow:hidden; }}
+code {{ font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }}
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1>Общее сравнение логов iCharger</h1>
+<p class="muted">Все испытания наложены друг на друга отдельными линиями. Щелчок по имени файла в легенде скрывает или показывает эту линию сразу на связанных графиках.</p>
+</header>
+<section class="card">
+<h2>Временная сетка</h2>
+<p class="note">Исходные отчёты используют каждый записанный отсчёт. Только общий сравнительный график интерполируется на единую сетку с периодом <b>{comparison_step_s:g} s</b>, чтобы логи с разной частотой записи можно было корректно накладывать и чтобы HTML оставался отзывчивым.</p>
+<div class="table-wrap"><table><thead><tr><th>Файл</th><th>Банки</th><th>Часы</th><th>Отсчёты</th><th>Медиана, s</th><th>Min, s</th><th>Max, s</th><th>Разрывы</th><th>Ah</th><th>Wh</th><th>Конец, V</th><th>Min cell</th></tr></thead><tbody>{table_rows}</tbody></table></div>
+</section>
+{''.join(figure_html)}
+</main>
+</body>
+</html>"""
+    output_file.write_text(document, encoding="utf-8")
