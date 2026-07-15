@@ -1,3 +1,3 @@
-#!/bin/bash
-
-python3 scripts/install.py
+#!/usr/bin/env sh
+set -eu
+python3 -m pip install -r requirements.txt
