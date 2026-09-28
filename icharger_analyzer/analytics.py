@@ -61,6 +61,11 @@ class AnalysisSummary:
     end_battery_voltage_v: float
     integration_omitted_s: float
     duplicate_timestamp_count: int
+    counter_discharge_energy_wh: float
+    counter_charge_energy_wh: float
+    counter_energy_wh: float
+    counter_energy_skipped_intervals: int
+    counter_jump_count: int
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -166,7 +171,8 @@ def build_telemetry_frame(log: ChargerLog, energy_voltage: str = "auto") -> pd.D
     use_cells = complete_cells and energy_voltage != "output"
     source = "cells" if use_cells else "output"
     if use_cells:
-        source_note = f"Сумма {len(cells)} измеряемых банок; балансирные данные полны во всём логе."
+        voltage_description = "Напряжение первой банки" if len(cells) == 1 else f"Сумма напряжений {len(cells)} банок"
+        source_note = f"{voltage_description}; балансирные данные полны во всём логе."
     elif energy_voltage == "output":
         source_note = "Напряжение силового выхода выбрано вручную."
     else:
@@ -201,6 +207,35 @@ def build_telemetry_frame(log: ChargerLog, energy_voltage: str = "auto") -> pd.D
 
     initial_counter = float(frame["capacity_mah_signed"].iloc[0])
     frame["capacity_counter_ah"] = (frame["capacity_mah_signed"] - initial_counter).abs() / 1000.0
+
+    # Energy requested from the device's mAh counter and balance voltage:
+    # V * mAh / 1000 = Wh. No extra time factor or division by 3600.
+    delta_mah = frame["capacity_mah_signed"].diff().fillna(0.0)
+    previous_voltage = frame["battery_voltage_v"].shift(1).fillna(frame["battery_voltage_v"])
+    average_voltage = (previous_voltage + frame["battery_voltage_v"]) / 2.0
+    previous_current = frame["current_a"].shift(1).fillna(frame["current_a"])
+    current_limit = np.maximum(previous_current.abs(), frame["current_a"].abs())
+    # Current is used only to flag likely counter resets/corruption, not to
+    # compute this energy. Allow rounding and generous transient tolerance.
+    opposite_direction = (
+        ((previous_current < 0) & (frame["current_a"] < 0) & (delta_mah > 0))
+        | ((previous_current > 0) & (frame["current_a"] > 0) & (delta_mah < 0))
+    )
+    implausible_jump = (current_limit > 0) & (
+        delta_mah.abs() > 5 * current_limit * frame["dt_s"] / 3.6 + 2
+    )
+    frame["counter_jump"] = opposite_direction | implausible_jump
+    frame["counter_energy_skipped"] = (delta_mah != 0) & (
+        (frame["integration_dt_s"] <= 0) | frame["counter_jump"]
+    )
+    frame["counter_delta_mah_signed"] = delta_mah
+    accepted_delta_ah = delta_mah.where(~frame["counter_energy_skipped"], 0.0) / 1000.0
+    frame["counter_incremental_energy_wh_signed"] = average_voltage * accepted_delta_ah
+    increments = frame["counter_incremental_energy_wh_signed"]
+    frame["counter_charge_energy_wh"] = increments.clip(lower=0).cumsum()
+    frame["counter_discharge_energy_wh"] = (-increments.clip(upper=0)).cumsum()
+    frame["counter_energy_throughput_wh"] = increments.abs().cumsum()
+    frame["counter_energy_wh_signed"] = increments.cumsum()
 
     cell_columns = available_cell_columns(frame)
     if cell_columns:
@@ -345,6 +380,11 @@ def calculate_summary(log: ChargerLog, telemetry: pd.DataFrame, status: pd.DataF
         end_battery_voltage_v=float(telemetry["battery_voltage_v"].iloc[-1]),
         integration_omitted_s=float(telemetry["integration_omitted_s"].sum()),
         duplicate_timestamp_count=int(telemetry["timestamp_ms"].duplicated().sum()),
+        counter_discharge_energy_wh=float(telemetry["counter_discharge_energy_wh"].iloc[-1]),
+        counter_charge_energy_wh=float(telemetry["counter_charge_energy_wh"].iloc[-1]),
+        counter_energy_wh=float(telemetry["counter_energy_throughput_wh"].iloc[-1]),
+        counter_energy_skipped_intervals=int(telemetry["counter_energy_skipped"].sum()),
+        counter_jump_count=int(telemetry["counter_jump"].sum()),
     )
 
 

@@ -109,19 +109,50 @@ def _document(title: str, body: str, *, standalone: bool) -> str:
 <noscript>Для интерактивных графиков включите JavaScript. Числовая сводка доступна выше.</noscript></body></html>'''
 
 
+def _counter_inputs_html(log: ChargerLog, result: AnalysisResult) -> str:
+    """Show the actual fields and one accepted nonzero counter interval."""
+    first, last = log.telemetry[0], log.telemetry[-1]
+    s = result.summary
+    if s.battery_energy_source == "cells":
+        indices = [i for i in range(11, 21) if any(r.raw_values[i] > 0 for r in log.telemetry)]
+        fields = ", ".join(str(i + 1) for i in indices)
+        raw_voltage = " + ".join(str(first.raw_values[i]) for i in indices)
+        voltage_label = "Напряжение банки" if len(indices) == 1 else "Сумма напряжений банок"
+    else:
+        fields, raw_voltage, voltage_label = "8", str(first.raw_values[7]), "Напряжение силового выхода"
+    rows = _rows({
+        "Счётчик ёмкости · поле 9 (индекс 8)": f"{first.raw_values[8]} → {last.raw_values[8]} mAh",
+        f"{voltage_label} · поле {fields}": f"Начало: ({raw_voltage}) / 1000 = {s.start_battery_voltage_v:.3f} V",
+    })
+    example = ""
+    frame = result.telemetry
+    candidates = frame.index[(frame["counter_delta_mah_signed"] != 0) & ~frame["counter_energy_skipped"]]
+    if len(candidates):
+        index = int(candidates[0])
+        previous, current = frame.iloc[index - 1], frame.iloc[index]
+        delta = abs(float(current["counter_delta_mah_signed"]))
+        increment = abs(float(current["counter_incremental_energy_wh_signed"]))
+        example = (
+            f'<p class="note">Пример из этого лога, {previous["time_s"]:g}–{current["time_s"]:g} s: '
+            f'счётчик {previous["capacity_mah_signed"]:g} → {current["capacity_mah_signed"]:g} mAh. '
+            f'ΔE = ({previous["battery_voltage_v"]:.3f} + {current["battery_voltage_v"]:.3f}) / 2 '
+            f'× {delta:g} / 1000 = <b>{increment:.7f} Wh</b>.</p>'
+        )
+    return f'<div class="table-wrap"><table>{rows}</table></div>{example}'
+
+
 def write_report(log: ChargerLog, result: AnalysisResult, figures: list[go.Figure], output_file: Path, *, standalone: bool = True) -> None:
     s = result.summary
-    source = "по сумме банок" if s.battery_energy_source == "cells" else "по силовому выходу"
-    discharge = s.discharge_capacity_ah > 0
-    charged = s.charge_capacity_ah > 0
-    energy = s.discharge_energy_wh if discharge else s.charge_energy_wh
-    output_energy = s.output_discharge_energy_wh if discharge else s.output_charge_energy_wh
+    source = "по балансиру" if s.battery_energy_source == "cells" else "по силовому выходу"
+    discharge = s.counter_discharge_energy_wh > 0
+    charged = s.counter_charge_energy_wh > 0
+    energy = s.counter_discharge_energy_wh if discharge else s.counter_charge_energy_wh
     label = "Отдано батареей" if discharge else "Принято батареей"
     mode = "Заряд + разряд" if discharge and charged else "Разряд" if discharge else "Заряд" if charged else "Покой"
     kpis = [
-        (label, _fmt(energy, 2, " Wh"), source, "primary"),
-        ("Ёмкость по счётчику", _fmt(s.capacity_counter_ah, 3, " Ah"), f"Интеграл |I|: {s.integrated_capacity_ah:.3f} Ah", ""),
-        ("Энергия силового выхода", _fmt(output_energy, 2, " Wh"), "разряд" if discharge else "заряд", ""),
+        (label, _fmt(energy, 2, " Wh"), f"Счётчик mAh · {source}", "primary"),
+        ("Ёмкость по счётчику", _fmt(s.capacity_counter_ah, 3, " Ah"), "Изменение счётчика mAh / 1000", ""),
+        ("Конечное напряжение батареи", _fmt(s.end_battery_voltage_v, 3, " V"), f"Начало: {s.start_battery_voltage_v:.3f} V", ""),
         ("Длительность", _duration(s.duration_s), f"{s.samples:,} отсчётов · {s.nominal_sample_rate_hz:g} Hz".replace(",", " "), ""),
     ]
     kpi_html = "".join(
@@ -144,12 +175,10 @@ def write_report(log: ChargerLog, result: AnalysisResult, figures: list[go.Figur
         "Последнее полное IR (оценка)": _fmt(s.latest_total_ir_mohm, 1, " mΩ"),
     }
     energy_rows = _rows({
-        "Батарея: отдано / принято": f"{s.discharge_energy_wh:.3f} / {s.charge_energy_wh:.3f} Wh",
-        "Силовой выход: отдано / принято": f"{s.output_discharge_energy_wh:.3f} / {s.output_charge_energy_wh:.3f} Wh",
-        "Интеграл тока: разряд / заряд": f"{s.discharge_capacity_ah:.4f} / {s.charge_capacity_ah:.4f} Ah",
-        "Разница энергий при разряде": f"{s.energy_difference_wh:.3f} Wh",
+        "По счётчику: отдано / принято": f"{s.counter_discharge_energy_wh:.6f} / {s.counter_charge_energy_wh:.6f} Wh",
+        "Изменение счётчика ёмкости": f"{s.capacity_counter_ah:.3f} Ah",
         "Батарея: начало → конец": f"{s.start_battery_voltage_v:.3f} → {s.end_battery_voltage_v:.3f} V",
-        "Силовой выход: начало → конец": f"{s.start_pack_voltage_v:.3f} → {s.end_pack_voltage_v:.3f} V",
+        "Исключённых приращений / скачков счётчика": f"{s.counter_energy_skipped_intervals} / {s.counter_jump_count}",
     })
     limitation = ""
     if s.integration_omitted_s:
@@ -157,7 +186,9 @@ def write_report(log: ChargerLog, result: AnalysisResult, figures: list[go.Figur
     if s.battery_energy_source == "output":
         limitation += f'<p class="note">{html.escape(s.battery_energy_source_note)} Энергия на самой батарее без балансирного измерения отдельно не определяется.</p>'
     if discharge and charged:
-        limitation += f'<p class="note">Смешанный цикл: отдано {s.discharge_energy_wh:.2f} Wh, принято {s.charge_energy_wh:.2f} Wh. Счётчик Ah показывает изменение от первой строки; интегралы направлений приведены отдельно.</p>'
+        limitation += f'<p class="note">Смешанный цикл: отдано {s.counter_discharge_energy_wh:.2f} Wh, принято {s.counter_charge_energy_wh:.2f} Wh. Счётчик Ah показывает изменение от первой строки; энергия направлений приведена отдельно.</p>'
+    if s.counter_jump_count:
+        limitation += f'<p class="note warn">Подозрительные скачки или сбросы счётчика: {s.counter_jump_count}. Эти приращения исключены из расчёта Wh.</p>'
     nav, charts = _chart_sections([
         ("По времени" if i == 0 else "По ёмкости", "Масштаб, диапазон и легенда действуют только на этот график.", fig)
         for i, fig in enumerate(figures)
@@ -168,12 +199,12 @@ def write_report(log: ChargerLog, result: AnalysisResult, figures: list[go.Figur
 <section class="kpis">{kpi_html}</section>
 <div class="facts"><span>Батарея <b>{s.start_battery_voltage_v:.3f} → {s.end_battery_voltage_v:.3f} V</b></span><span>Пик разряда <b>{s.peak_discharge_current_a:.2f} A</b></span><span>Мин. банка <b>{_fmt(s.min_cell_voltage_v, 3, ' V')}</b></span><span>Разрывы <b>{s.telemetry_gap_count}</b></span><span>Ошибки строк <b>{len(log.issues)}</b></span></div>
 {limitation}
-<details class="card"><summary>Расчёт Wh и источники напряжения</summary><div class="detail-grid"><div><div class="table-wrap"><table>{energy_rows}</table></div></div><div>
+<details class="card" open><summary>Расчёт Wh: счётчик ёмкости и напряжение банки</summary><div class="detail-grid"><div>{_counter_inputs_html(log, result)}<div class="table-wrap"><table>{energy_rows}</table></div></div><div>
 <p>{html.escape(s.battery_energy_source_note)}</p>
-<p class="formula">Pᵢ = Uᵢ × Iᵢ<br>E = Σ (Pᵢ₋₁ + Pᵢ) / 2 × Δtᵢ / 3600</p>
-<p class="muted">U — в вольтах, I — в амперах, Δt — в секундах. Заряд и разряд интегрируются отдельно, с разделением интервала при смене знака тока. Используются все исходные отсчёты.</p>
+<p class="formula">ΔQᵢ = |qᵢ − qᵢ₋₁| / 1000<br>Uсрᵢ = (Uᵢ₋₁ + Uᵢ) / 2<br>E = Σ Uсрᵢ × ΔQᵢ</p>
+<p class="muted">q — знаковый счётчик в mAh, U — напряжение в V, ΔQ — приращение в Ah, E — энергия в Wh. Отданная энергия суммируется по отрицательным приращениям счётчика, принятая — по положительным. Время используется для оси графика и проверки разрывов. Дополнительное деление на 3600 не требуется.</p>
 <p class="note">Wh — энергия за записанный участок испытания. Полную доступную энергию можно оценить по полному разряду при заданных условиях. Умножение Ah на начальное напряжение не учитывает изменение напряжения.</p>
-<p class="note">Разница напряжений и энергий может включать падение на проводах и контактах, а также погрешность измерений. Балансирные каналы должны охватывать все последовательные банки батареи.</p>
+<p class="note">Для нескольких последовательных банок U = сумма их напряжений. Балансирные каналы должны охватывать всю батарею. Ток не входит в эту формулу; он используется только при проверке подозрительных скачков счётчика.</p>
 </div></div></details>
 <details class="card"><summary>Устройство и качество записи</summary><div class="table-wrap"><table>{_rows(metadata)}</table></div><p class="note">Масштаб сопротивления пакета 128 принят по структуре файлов и сумме полей; это оценка. Сырые поля сохраняются парсером.</p></details>
 <div class="section-heading"><h2>Графики</h2><span class="help">Независимое управление</span></div>{nav}{charts}
@@ -189,8 +220,8 @@ def write_comparison_report(rows: list[dict[str, object]], figures: list[tuple[s
         '<tr>'
         f'<td><a href="{html.escape(str(row["report"]), quote=True)}">{html.escape(str(row["file"]))}</a></td>'
         f'<td>{row["cells"]}</td><td>{float(row["duration_h"]):.2f}</td>'
-        f'<td>{float(row["capacity_ah"]):.3f}</td><td>{float(row["discharge_energy_wh"]):.2f}</td>'
-        f'<td>{float(row["charge_energy_wh"]):.2f}</td><td>{float(row["energy_wh"]):.2f}</td>'
+        f'<td>{float(row["capacity_ah"]):.3f}</td><td>{float(row["counter_discharge_energy_wh"]):.2f}</td>'
+        f'<td>{float(row["counter_charge_energy_wh"]):.2f}</td>'
         f'<td>{"Банки" if row["battery_energy_source"] == "cells" else "Силовой выход"}</td>'
         f'<td>{float(row["integration_omitted_s"]):g}</td><td>{float(row["median_interval_s"]):g}</td>'
         f'<td>{int(row["gap_count"])}</td><td>{html.escape(str(row["min_cell_v"]))}</td></tr>'
@@ -198,8 +229,8 @@ def write_comparison_report(rows: list[dict[str, object]], figures: list[tuple[s
     )
     nav, charts = _chart_sections(figures)
     body = f'''<header><div class="eyebrow">Battery lab / iCharger</div><h1>Сравнение испытаний</h1><p class="subtitle">{len(rows)} логов · отдельная линия для каждого файла · общий шаг {comparison_step_s:g} s</p></header>
-<section class="card"><h2>Результаты</h2><div class="table-wrap"><table class="summary-table"><thead><tr><th>Файл</th><th>Банки</th><th>Часы</th><th>Счётчик, Ah</th><th>Отдано, Wh</th><th>Принято, Wh</th><th>Выход ∑, Wh</th><th>Источник U</th><th>Пропущено, s</th><th>Период, s</th><th>Разрывы</th><th>Min cell, V</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>
-<details class="card"><summary>Как читать сравнение</summary><p class="note">Итоги посчитаны по исходным отсчётам. Только сравнительные линии интерполированы на сетку {comparison_step_s:g} s. Отдельные отчёты сохраняют все точки. Нажмите на имя файла в легенде, чтобы скрыть или показать линию на выбранном графике.</p><p class="note">Источник U указан для каждого файла. Wh батареи по балансиру и по силовому выходу относятся к разным точкам измерения. «Выход ∑» — сумма энергии заряда и разряда на силовом выходе.</p></details>
+<section class="card"><h2>Результаты</h2><div class="table-wrap"><table class="summary-table"><thead><tr><th>Файл</th><th>Банки</th><th>Часы</th><th>Счётчик, Ah</th><th>Отдано, Wh</th><th>Принято, Wh</th><th>Источник U</th><th>Пропущено, s</th><th>Период, s</th><th>Разрывы</th><th>Min cell, V</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>
+<details class="card"><summary>Как читать сравнение</summary><p class="note">Энергия рассчитана по приращениям счётчика mAh: E = Σ Uср × |Δq| / 1000. Только сравнительные линии интерполированы на сетку {comparison_step_s:g} s. Отдельные отчёты сохраняют все точки. Нажмите на имя файла в легенде, чтобы скрыть или показать линию на выбранном графике.</p><p class="note">Источник напряжения указан для каждого файла. Расчёт по балансиру и по силовому выходу относится к разным точкам измерения.</p></details>
 <div class="section-heading"><h2>Графики</h2><span class="help">Независимое управление</span></div>{nav}{charts}'''
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text(_document("iCharger — сравнение испытаний", body, standalone=standalone), encoding="utf-8")

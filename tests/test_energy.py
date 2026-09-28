@@ -97,3 +97,55 @@ def test_real_discharge_fields_and_checksum(tmp_path):
     assert "Checksum mismatch" in log.issues[0].message
     assert log.telemetry[0].pack_voltage_v == pytest.approx(4.252)
     assert log.telemetry[0].cell_voltages_v[0] == pytest.approx(4.246)
+
+
+def test_counter_energy_uses_increment_and_average_voltage():
+    log = log_from_samples([0, 1800, 3600], [-2] * 3)
+    for record, counter, voltage in zip(log.telemetry, [-500, -1500, -3500], [4, 3, 2]):
+        record.capacity_mah_signed = counter
+        record.cell_voltages_v = (voltage,) + (None,) * 9
+    result = analyze_log(log)
+    # 3.5 V * 1 Ah + 2.5 V * 2 Ah, excluding the unknown history before -500 mAh.
+    assert result.summary.counter_discharge_energy_wh == pytest.approx(8.5)
+    assert result.summary.counter_charge_energy_wh == 0
+    assert result.summary.counter_energy_skipped_intervals == 0
+
+
+def test_counter_energy_does_not_recompute_charge_from_current():
+    log = log_from_samples([0, 60, 120], [-2] * 3)
+    result = analyze_log(log)  # all counter values are 0
+    assert result.summary.discharge_energy_wh > 0
+    assert result.summary.counter_discharge_energy_wh == 0
+    for record, counter in zip(log.telemetry, [0, -30, -60]):
+        record.capacity_mah_signed = counter
+    assert analyze_log(log).summary.counter_discharge_energy_wh == pytest.approx(.24)
+
+
+def test_counter_reset_is_not_counted_as_charge():
+    log = log_from_samples([0, 1, 2, 3], [-3.6] * 4)
+    for record, counter in zip(log.telemetry, [-100, -101, 0, -1]):
+        record.capacity_mah_signed = counter
+    s = analyze_log(log).summary
+    assert s.counter_discharge_energy_wh == pytest.approx(.008)
+    assert s.counter_charge_energy_wh == 0
+    assert s.counter_jump_count == 1
+    assert s.counter_energy_skipped_intervals == 1
+
+
+def test_counter_energy_gap_and_duplicate_are_not_filled_in():
+    log = log_from_samples([0, 1, 1, 2, 100, 101], [-3.6] * 6)
+    for record, counter in zip(log.telemetry, [0, -1, -2, -3, -101, -102]):
+        record.capacity_mah_signed = counter
+    s = analyze_log(log).summary
+    assert s.counter_discharge_energy_wh == pytest.approx(.012)
+    assert s.counter_energy_skipped_intervals == 2
+
+
+def test_counter_positive_and_negative_directions():
+    log = log_from_samples([0, 3600, 7200], [0, 0, 0], cells=(4, 4))
+    for record, counter in zip(log.telemetry, [0, 1000, 500]):
+        record.capacity_mah_signed = counter
+    s = analyze_log(log).summary
+    assert s.counter_charge_energy_wh == pytest.approx(8)
+    assert s.counter_discharge_energy_wh == pytest.approx(4)
+    assert s.counter_energy_wh == pytest.approx(12)

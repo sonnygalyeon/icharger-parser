@@ -120,14 +120,15 @@ def create_time_dashboard(
         status.get("total_ir_mohm", pd.Series(dtype=float)).notna().any()
         or bool(available_ir_columns(status))
     )
-    ir_row = 7 if has_ir else None
-    sampling_row = 8 if has_ir else 7
+    ir_row = 8 if has_ir else None
+    sampling_row = 9 if has_ir else 8
     rows = sampling_row
 
     titles = [
         "Напряжение батареи, силового выхода и входа",
         "Ток и мощность",
-        "Отданная/принятая ёмкость и энергия",
+        "Ёмкость по счётчику, Ah",
+        "Энергия батареи по счётчику, Wh",
         "Температура",
         "Напряжения банок",
         "Разброс напряжений банок",
@@ -138,7 +139,7 @@ def create_time_dashboard(
 
     specs: list[list[dict[str, bool]]] = []
     for row in range(1, rows + 1):
-        specs.append([{"secondary_y": row in (2, 3, sampling_row)}])
+        specs.append([{"secondary_y": row in (2, sampling_row)}])
 
     fig = make_subplots(
         rows=rows,
@@ -173,29 +174,27 @@ def create_time_dashboard(
         secondary_y=False,
     )
     fig.add_trace(
-        _line(telemetry, "time_s", "energy_throughput_wh", "Энергия силового выхода", unit="Wh", opacity=0.65),
-        row=3,
+        _line(telemetry, "time_s", "counter_discharge_energy_wh", "Отданная энергия · U × ΔQ", unit="Wh"),
+        row=4,
         col=1,
-        secondary_y=True,
     )
-    fig.add_trace(_line(telemetry, "time_s", "discharge_energy_wh", "Отдано батареей", unit="Wh"), row=3, col=1, secondary_y=True)
-    if telemetry["charge_energy_wh"].iloc[-1] > 0:
-        fig.add_trace(_line(telemetry, "time_s", "charge_energy_wh", "Принято батареей", unit="Wh"), row=3, col=1, secondary_y=True)
+    if telemetry["counter_charge_energy_wh"].iloc[-1] > 0:
+        fig.add_trace(_line(telemetry, "time_s", "counter_charge_energy_wh", "Принятая энергия · U × ΔQ", unit="Wh"), row=4, col=1)
 
     if telemetry["internal_temp_c"].notna().any():
-        fig.add_trace(_line(telemetry, "time_s", "internal_temp_c", "Внутренняя, °C", unit="°C"), row=4, col=1)
+        fig.add_trace(_line(telemetry, "time_s", "internal_temp_c", "Внутренняя, °C", unit="°C"), row=5, col=1)
     if telemetry["external_temp_c"].notna().any():
-        fig.add_trace(_line(telemetry, "time_s", "external_temp_c", "Внешняя, °C", unit="°C"), row=4, col=1)
+        fig.add_trace(_line(telemetry, "time_s", "external_temp_c", "Внешняя, °C", unit="°C"), row=5, col=1)
 
     for index, column in enumerate(cell_columns, start=1):
-        fig.add_trace(_line(telemetry, "time_s", column, f"Банка {index}", unit="V"), row=5, col=1)
+        fig.add_trace(_line(telemetry, "time_s", column, f"Банка {index}", unit="V"), row=6, col=1)
 
     if cell_columns:
         delta_frame = telemetry.copy()
         delta_frame["cell_delta_mv"] = delta_frame["cell_delta_v"] * 1000.0
-        fig.add_trace(_line(delta_frame, "time_s", "cell_delta_mv", "Δ банок, mV", unit="mV"), row=6, col=1)
-        fig.add_hline(y=20, line_dash="dash", opacity=0.55, row=6, col=1)
-        fig.add_hline(y=50, line_dash="dash", opacity=0.55, row=6, col=1)
+        fig.add_trace(_line(delta_frame, "time_s", "cell_delta_mv", "Δ банок, mV", unit="mV"), row=7, col=1)
+        fig.add_hline(y=20, line_dash="dash", opacity=0.55, row=7, col=1)
+        fig.add_hline(y=50, line_dash="dash", opacity=0.55, row=7, col=1)
 
     if has_ir and ir_row is not None:
         status_plot = status.copy()
@@ -246,10 +245,10 @@ def create_time_dashboard(
     fig.update_yaxes(title_text="A", row=2, col=1, secondary_y=False)
     fig.update_yaxes(title_text="W", row=2, col=1, secondary_y=True)
     fig.update_yaxes(title_text="Ah", row=3, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Wh", row=3, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="°C", row=4, col=1)
-    fig.update_yaxes(title_text="V", row=5, col=1)
-    fig.update_yaxes(title_text="mV", row=6, col=1)
+    fig.update_yaxes(title_text="Wh", row=4, col=1)
+    fig.update_yaxes(title_text="°C", row=5, col=1)
+    fig.update_yaxes(title_text="V", row=6, col=1)
+    fig.update_yaxes(title_text="mV", row=7, col=1)
     if has_ir and ir_row is not None:
         fig.update_yaxes(title_text="mΩ", row=ir_row, col=1)
     fig.update_yaxes(title_text="s", row=sampling_row, col=1, secondary_y=False)
@@ -356,6 +355,9 @@ def resample_for_comparison(frame: pd.DataFrame, step_s: float) -> pd.DataFrame:
         "battery_energy_throughput_wh",
         "discharge_energy_wh",
         "charge_energy_wh",
+        "counter_discharge_energy_wh",
+        "counter_charge_energy_wh",
+        "counter_energy_throughput_wh",
         "internal_temp_c",
         "external_temp_c",
         "cell_min_v",
@@ -407,7 +409,7 @@ def create_comparison_time_dashboard(series: ComparisonSeries, step_s: float) ->
         "Ток",
         "Мощность",
         "Ёмкость",
-        "Энергия батареи · заряд + разряд",
+        "Энергия батареи по счётчику · заряд + разряд",
         "Внутренняя температура",
         "Минимальная банка",
         "Разбаланс банок",
@@ -421,7 +423,7 @@ def create_comparison_time_dashboard(series: ComparisonSeries, step_s: float) ->
         ("current_a", "A"),
         ("power_w", "W"),
         ("capacity_counter_ah", "Ah"),
-        ("battery_energy_throughput_wh", "Wh"),
+        ("counter_energy_throughput_wh", "Wh"),
         ("internal_temp_c", "°C"),
         ("cell_min_v", "V"),
         ("cell_delta_v", "V"),

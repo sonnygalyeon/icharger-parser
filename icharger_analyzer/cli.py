@@ -145,6 +145,11 @@ def run(argv: list[str] | None = None) -> int:
                     "capacity_ah": summary.capacity_counter_ah,
                     "energy_wh": summary.integrated_energy_wh,
                     "battery_energy_wh": summary.battery_energy_wh,
+                    "counter_discharge_energy_wh": summary.counter_discharge_energy_wh,
+                    "counter_charge_energy_wh": summary.counter_charge_energy_wh,
+                    "counter_energy_wh": summary.counter_energy_wh,
+                    "counter_energy_skipped_intervals": summary.counter_energy_skipped_intervals,
+                    "counter_jump_count": summary.counter_jump_count,
                     "discharge_energy_wh": summary.discharge_energy_wh,
                     "charge_energy_wh": summary.charge_energy_wh,
                     "output_discharge_energy_wh": summary.output_discharge_energy_wh,
@@ -163,8 +168,8 @@ def run(argv: list[str] | None = None) -> int:
             print(
                 f"    OK: {summary.samples} samples, {summary.duration_s / 3600:.2f} h, "
                 f"{summary.capacity_counter_ah:.3f} Ah, "
-                f"discharge {summary.discharge_energy_wh:.2f} Wh / charge {summary.charge_energy_wh:.2f} Wh "
-                f"({summary.battery_energy_source}) -> {output_dir / report_name}"
+                f"discharge {summary.counter_discharge_energy_wh:.2f} Wh / charge {summary.counter_charge_energy_wh:.2f} Wh "
+                f"(capacity counter, {summary.battery_energy_source}) -> {output_dir / report_name}"
             )
         except Exception as exc:  # CLI boundary: continue with remaining files.
             failures += 1
