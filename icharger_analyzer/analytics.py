@@ -47,6 +47,20 @@ class AnalysisSummary:
     latest_cells_ir_sum_mohm: float | None
     parse_issue_count: int
     status_record_count: int
+    battery_energy_source: str
+    battery_energy_source_note: str
+    battery_energy_wh: float
+    discharge_energy_wh: float
+    charge_energy_wh: float
+    output_discharge_energy_wh: float
+    output_charge_energy_wh: float
+    discharge_capacity_ah: float
+    charge_capacity_ah: float
+    energy_difference_wh: float
+    start_battery_voltage_v: float
+    end_battery_voltage_v: float
+    integration_omitted_s: float
+    duplicate_timestamp_count: int
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -79,11 +93,36 @@ def _format_elapsed_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
 
-def build_telemetry_frame(log: ChargerLog) -> pd.DataFrame:
+def _directional_increments(values: pd.Series, dt_s: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """Integrate positive/negative parts of a piecewise-linear signal.
+
+    Split at a zero crossing so a charge/discharge transition cannot cancel
+    real throughput. The first sample and duplicate timestamps have dt=0.
+    """
+    end = values.to_numpy(dtype=float)
+    start = np.r_[end[0], end[:-1]]
+    positive = (np.maximum(start, 0) + np.maximum(end, 0)) / 2
+    negative = (np.maximum(-start, 0) + np.maximum(-end, 0)) / 2
+    crossing = start * end < 0
+    denominator = np.abs(start) + np.abs(end)
+    correction = np.divide(
+        np.abs(start * end), 2 * denominator,
+        out=np.zeros_like(end), where=crossing,
+    )
+    hours = dt_s.to_numpy(dtype=float) / 3600
+    return (positive - correction) * hours, (negative - correction) * hours
+
+
+def build_telemetry_frame(log: ChargerLog, energy_voltage: str = "auto") -> pd.DataFrame:
+    if energy_voltage not in {"auto", "cells", "output"}:
+        raise ValueError("energy_voltage must be auto, cells or output")
+    if len({record.channel for record in log.telemetry}) > 1:
+        raise ValueError("Несколько каналов в одном файле: разделите CH1 и CH2 для расчёта энергии.")
     rows: list[dict[str, object]] = []
     for sample, record in enumerate(log.telemetry):
         row: dict[str, object] = {
             "sample": sample,
+            "channel": record.channel,
             "timestamp_ms": record.timestamp_ms,
             "battery_type_code": record.battery_type_code,
             "flags": record.flags,
@@ -111,19 +150,54 @@ def build_telemetry_frame(log: ChargerLog) -> pd.DataFrame:
     frame["power_w"] = frame["pack_voltage_v"] * frame["current_a"]
     frame["abs_power_w"] = frame["power_w"].abs()
 
-    # Signed trapezoidal integration; throughput columns use absolute values.
-    previous_current = frame["current_a"].shift(1).fillna(frame["current_a"])
-    previous_power = frame["power_w"].shift(1).fillna(frame["power_w"])
-    frame["incremental_capacity_ah_signed"] = (
-        ((frame["current_a"] + previous_current) / 2.0) * frame["dt_s"] / 3600.0
+    # Do not invent energy over large gaps. Keep the raw dt and expose coverage.
+    positive_dt = frame.loc[frame["dt_s"] > 0, "dt_s"]
+    median_dt = float(positive_dt.median()) if not positive_dt.empty else 0.0
+    gap_limit = max(median_dt * 2.5, median_dt + 2.0)
+    frame["integration_omitted_s"] = frame["dt_s"].where(frame["dt_s"] > gap_limit, 0.0)
+    frame["integration_dt_s"] = frame["dt_s"] - frame["integration_omitted_s"]
+
+    cells = available_cell_columns(frame)
+    contiguous = cells == [f"cell_{index}_v" for index in range(1, len(cells) + 1)]
+    complete_cells = bool(cells) and contiguous and bool(frame[cells].notna().all().all())
+    frame["cell_sum_voltage_v"] = frame[cells].sum(axis=1, min_count=len(cells)) if cells else np.nan
+    if energy_voltage == "cells" and not complete_cells:
+        raise ValueError("Для --energy-voltage cells нужны все обнаруженные банки в каждом отсчёте.")
+    use_cells = complete_cells and energy_voltage != "output"
+    source = "cells" if use_cells else "output"
+    if use_cells:
+        source_note = f"Сумма {len(cells)} измеряемых банок; балансирные данные полны во всём логе."
+    elif energy_voltage == "output":
+        source_note = "Напряжение силового выхода выбрано вручную."
+    else:
+        source_note = "Полных балансирных данных нет; использовано напряжение силового выхода."
+    frame["battery_voltage_source"] = source
+    frame.attrs["battery_energy_source_note"] = source_note
+    frame["battery_voltage_v"] = frame["cell_sum_voltage_v"] if use_cells else frame["pack_voltage_v"]
+    frame["voltage_difference_v"] = frame["cell_sum_voltage_v"] - frame["pack_voltage_v"]
+    frame["battery_power_w"] = frame["battery_voltage_v"] * frame["current_a"]
+
+    charge_ah, discharge_ah = _directional_increments(frame["current_a"], frame["integration_dt_s"])
+    charge_wh, discharge_wh = _directional_increments(frame["power_w"], frame["integration_dt_s"])
+    battery_charge_wh, battery_discharge_wh = _directional_increments(
+        frame["battery_power_w"], frame["integration_dt_s"]
     )
-    frame["incremental_energy_wh_signed"] = (
-        ((frame["power_w"] + previous_power) / 2.0) * frame["dt_s"] / 3600.0
-    )
-    frame["integrated_capacity_ah_signed"] = frame["incremental_capacity_ah_signed"].cumsum()
-    frame["integrated_energy_wh_signed"] = frame["incremental_energy_wh_signed"].cumsum()
-    frame["capacity_throughput_ah"] = frame["incremental_capacity_ah_signed"].abs().cumsum()
-    frame["energy_throughput_wh"] = frame["incremental_energy_wh_signed"].abs().cumsum()
+    frame["incremental_capacity_ah_signed"] = charge_ah - discharge_ah
+    frame["incremental_energy_wh_signed"] = charge_wh - discharge_wh
+    frame["integrated_capacity_ah_signed"] = np.cumsum(charge_ah - discharge_ah)
+    frame["integrated_energy_wh_signed"] = np.cumsum(charge_wh - discharge_wh)
+    frame["charge_capacity_ah"] = np.cumsum(charge_ah)
+    frame["discharge_capacity_ah"] = np.cumsum(discharge_ah)
+    frame["capacity_throughput_ah"] = np.cumsum(charge_ah + discharge_ah)
+    # Existing output-energy columns retain their voltage source.
+    frame["energy_throughput_wh"] = np.cumsum(charge_wh + discharge_wh)
+    frame["output_charge_energy_wh"] = np.cumsum(charge_wh)
+    frame["output_discharge_energy_wh"] = np.cumsum(discharge_wh)
+    frame["charge_energy_wh"] = np.cumsum(battery_charge_wh)
+    frame["discharge_energy_wh"] = np.cumsum(battery_discharge_wh)
+    frame["battery_energy_throughput_wh"] = np.cumsum(battery_charge_wh + battery_discharge_wh)
+    frame["battery_energy_wh_signed"] = np.cumsum(battery_charge_wh - battery_discharge_wh)
+    frame["energy_difference_wh"] = frame["discharge_energy_wh"] - frame["output_discharge_energy_wh"]
 
     initial_counter = float(frame["capacity_mah_signed"].iloc[0])
     frame["capacity_counter_ah"] = (frame["capacity_mah_signed"] - initial_counter).abs() / 1000.0
@@ -257,6 +331,20 @@ def calculate_summary(log: ChargerLog, telemetry: pd.DataFrame, status: pd.DataF
         latest_cells_ir_sum_mohm=_last_valid(status, "cells_ir_sum_mohm"),
         parse_issue_count=len(log.issues),
         status_record_count=len(status),
+        battery_energy_source=str(telemetry["battery_voltage_source"].iloc[0]),
+        battery_energy_source_note=telemetry.attrs["battery_energy_source_note"],
+        battery_energy_wh=float(telemetry["battery_energy_throughput_wh"].iloc[-1]),
+        discharge_energy_wh=float(telemetry["discharge_energy_wh"].iloc[-1]),
+        charge_energy_wh=float(telemetry["charge_energy_wh"].iloc[-1]),
+        output_discharge_energy_wh=float(telemetry["output_discharge_energy_wh"].iloc[-1]),
+        output_charge_energy_wh=float(telemetry["output_charge_energy_wh"].iloc[-1]),
+        discharge_capacity_ah=float(telemetry["discharge_capacity_ah"].iloc[-1]),
+        charge_capacity_ah=float(telemetry["charge_capacity_ah"].iloc[-1]),
+        energy_difference_wh=float(telemetry["energy_difference_wh"].iloc[-1]),
+        start_battery_voltage_v=float(telemetry["battery_voltage_v"].iloc[0]),
+        end_battery_voltage_v=float(telemetry["battery_voltage_v"].iloc[-1]),
+        integration_omitted_s=float(telemetry["integration_omitted_s"].sum()),
+        duplicate_timestamp_count=int(telemetry["timestamp_ms"].duplicated().sum()),
     )
 
 
@@ -374,8 +462,8 @@ def detect_warnings(telemetry: pd.DataFrame) -> list[AnalysisWarning]:
     return warnings
 
 
-def analyze_log(log: ChargerLog) -> AnalysisResult:
-    telemetry = build_telemetry_frame(log)
+def analyze_log(log: ChargerLog, energy_voltage: str = "auto") -> AnalysisResult:
+    telemetry = build_telemetry_frame(log, energy_voltage)
     status = build_status_frame(log, int(telemetry["timestamp_ms"].iloc[0]))
     summary = calculate_summary(log, telemetry, status)
     warnings = detect_warnings(telemetry)

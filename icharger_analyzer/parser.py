@@ -54,8 +54,10 @@ class IChargerParser:
                     values = self._parse_packet_values(line)
                     packet_type = values[1]
                     if packet_type == TELEMETRY_PACKET:
+                        self._validate_checksum(line, values[-1])
                         log.telemetry.append(self._decode_telemetry(values))
                     elif packet_type == STATUS_PACKET:
+                        self._validate_checksum(line, values[-1])
                         log.status.append(self._decode_status(values))
                     else:
                         unsupported[packet_type] += 1
@@ -77,6 +79,17 @@ class IChargerParser:
             raise IChargerParseError(f"No valid telemetry packets found in {path}{detail}")
 
         return log
+
+    @staticmethod
+    def _validate_checksum(line: str, received: int) -> None:
+        # SD packets: XOR of the exact ASCII bytes from '$' through the final
+        # semicolon, excluding the decimal checksum itself. Verified against
+        # all supplied 4010DUO examples, including telemetry and packet 128.
+        calculated = 0
+        for byte in line[:line.rfind(";") + 1].encode("ascii"):
+            calculated ^= byte
+        if received != calculated:
+            raise ValueError(f"Checksum mismatch: received {received}, calculated {calculated}")
 
     @staticmethod
     def _parse_packet_values(line: str) -> list[int]:

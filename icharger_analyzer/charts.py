@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from copy import deepcopy
 from math import floor, log10
 
 import numpy as np
@@ -17,6 +18,7 @@ PLOTLY_CONFIG = {
     "displaylogo": False,
     "responsive": True,
     "scrollZoom": True,
+    "displayModeBar": True,
     "modeBarButtonsToRemove": ["lasso2d", "select2d"],
 }
 
@@ -123,7 +125,7 @@ def create_time_dashboard(
     rows = sampling_row
 
     titles = [
-        "Напряжение батареи и входа",
+        "Напряжение батареи, силового выхода и входа",
         "Ток и мощность",
         "Отданная/принятая ёмкость и энергия",
         "Температура",
@@ -131,7 +133,7 @@ def create_time_dashboard(
         "Разброс напряжений банок",
     ]
     if has_ir:
-        titles.append("Внутреннее сопротивление (пакет 128, масштаб inferred)")
+        titles.append("Внутреннее сопротивление · оценка по пакету 128")
     titles.append("Период записи телеметрии и мгновенная частота")
 
     specs: list[list[dict[str, bool]]] = []
@@ -147,9 +149,10 @@ def create_time_dashboard(
         specs=specs,
     )
 
-    fig.add_trace(_line(telemetry, "time_s", "pack_voltage_v", "Батарея, V", unit="V"), row=1, col=1)
+    fig.add_trace(_line(telemetry, "time_s", "pack_voltage_v", "Силовой выход", unit="V"), row=1, col=1)
+    fig.add_trace(_line(telemetry, "time_s", "battery_voltage_v", "Батарея", unit="V"), row=1, col=1)
     fig.add_trace(
-        _line(telemetry, "time_s", "input_voltage_v", "Вход, V", unit="V", opacity=0.65),
+        _line(telemetry, "time_s", "input_voltage_v", "Вход, V", unit="V", opacity=0.65).update(visible="legendonly"),
         row=1,
         col=1,
     )
@@ -161,6 +164,7 @@ def create_time_dashboard(
         col=1,
         secondary_y=True,
     )
+    fig.add_trace(_line(telemetry, "time_s", "battery_power_w", "Мощность батареи", unit="W"), row=2, col=1, secondary_y=True)
 
     fig.add_trace(
         _line(telemetry, "time_s", "capacity_counter_ah", "Счётчик ёмкости, Ah", unit="Ah"),
@@ -169,11 +173,14 @@ def create_time_dashboard(
         secondary_y=False,
     )
     fig.add_trace(
-        _line(telemetry, "time_s", "energy_throughput_wh", "Энергия, Wh", unit="Wh"),
+        _line(telemetry, "time_s", "energy_throughput_wh", "Энергия силового выхода", unit="Wh", opacity=0.65),
         row=3,
         col=1,
         secondary_y=True,
     )
+    fig.add_trace(_line(telemetry, "time_s", "discharge_energy_wh", "Отдано батареей", unit="Wh"), row=3, col=1, secondary_y=True)
+    if telemetry["charge_energy_wh"].iloc[-1] > 0:
+        fig.add_trace(_line(telemetry, "time_s", "charge_energy_wh", "Принято батареей", unit="Wh"), row=3, col=1, secondary_y=True)
 
     if telemetry["internal_temp_c"].notna().any():
         fig.add_trace(_line(telemetry, "time_s", "internal_temp_c", "Внутренняя, °C", unit="°C"), row=4, col=1)
@@ -263,7 +270,8 @@ def create_discharge_curve(telemetry: pd.DataFrame) -> go.Figure:
         vertical_spacing=0.08,
         subplot_titles=("Напряжение батареи по отданной ёмкости", "Напряжения банок по отданной ёмкости"),
     )
-    fig.add_trace(_line(telemetry, "capacity_counter_ah", "pack_voltage_v", "Батарея, V", unit="V"), row=1, col=1)
+    fig.add_trace(_line(telemetry, "capacity_counter_ah", "pack_voltage_v", "Силовой выход", unit="V"), row=1, col=1)
+    fig.add_trace(_line(telemetry, "capacity_counter_ah", "battery_voltage_v", "Батарея", unit="V"), row=1, col=1)
     for index, column in enumerate(cell_columns, start=1):
         fig.add_trace(_line(telemetry, "capacity_counter_ah", column, f"Банка {index}", unit="V"), row=2, col=1)
     fig.update_yaxes(title_text="V", row=1, col=1)
@@ -343,6 +351,11 @@ def resample_for_comparison(frame: pd.DataFrame, step_s: float) -> pd.DataFrame:
         "power_w",
         "capacity_counter_ah",
         "energy_throughput_wh",
+        "battery_voltage_v",
+        "battery_power_w",
+        "battery_energy_throughput_wh",
+        "discharge_energy_wh",
+        "charge_energy_wh",
         "internal_temp_c",
         "external_temp_c",
         "cell_min_v",
@@ -394,7 +407,7 @@ def create_comparison_time_dashboard(series: ComparisonSeries, step_s: float) ->
         "Ток",
         "Мощность",
         "Ёмкость",
-        "Энергия",
+        "Энергия батареи · заряд + разряд",
         "Внутренняя температура",
         "Минимальная банка",
         "Разбаланс банок",
@@ -408,7 +421,7 @@ def create_comparison_time_dashboard(series: ComparisonSeries, step_s: float) ->
         ("current_a", "A"),
         ("power_w", "W"),
         ("capacity_counter_ah", "Ah"),
-        ("energy_throughput_wh", "Wh"),
+        ("battery_energy_throughput_wh", "Wh"),
         ("internal_temp_c", "°C"),
         ("cell_min_v", "V"),
         ("cell_delta_v", "V"),
@@ -527,3 +540,84 @@ def create_comparison_figure(series: ComparisonSeries) -> go.Figure:
 
     step_s = choose_comparison_step(series)
     return create_comparison_time_dashboard(series, step_s)
+
+
+def independent_charts(figure: go.Figure) -> list[go.Figure]:
+    """Turn each dashboard row into an independent, navigable Plotly figure.
+
+    Use the public axis/trace specification, preserving secondary axes, all
+    samples, threshold lines and warning regions. SVG avoids exhausting the
+    browser's WebGL-context limit when many separate charts are on screen.
+    """
+    layout = figure.layout.to_plotly_json()
+    axes = sorted(
+        (key for key in layout if key.startswith("xaxis")),
+        key=lambda key: int(key[5:] or "1"),
+    )
+    subtitles = [a for a in layout.get("annotations", []) if a.get("xref") == "paper" and a.get("yref") == "paper"]
+    x_title = next((layout[key]["title"] for key in reversed(axes) if layout[key].get("title")), {"text": "Время, s"})
+    x_title = {"text": x_title.get("text", "").split(" (")[0]}
+    charts = []
+    for index, axis_key in enumerate(axes):
+        x_ref = "x" + axis_key[5:]
+        traces = [t for t in figure.data if (t.xaxis or "x") == x_ref]
+        y_refs = sorted({t.yaxis or "y" for t in traces}, key=lambda key: int(key[1:] or "1"))
+        if not y_refs:
+            y_refs = [layout[axis_key].get("anchor", "y")]
+        mapping = {old: "y" if i == 0 else f"y{i + 1}" for i, old in enumerate(y_refs)}
+        chart = go.Figure()
+        for trace in traces:
+            data = trace.to_plotly_json()
+            data.update(xaxis="x", yaxis=mapping[trace.yaxis or "y"], showlegend=True)
+            data["type"] = "scatter"
+            if len(trace.x) == 1:
+                data["mode"] = "lines+markers"
+            chart.add_trace(data)
+        title = subtitles[index]["text"] if index < len(subtitles) else (figure.layout.title.text or "График")
+        _base_layout(chart, title, 470)
+        chart.update_layout(
+            title=None, dragmode="pan", autosize=True, margin={"l": 62, "r": 62, "t": 65, "b": 42},
+            legend={"x": 0, "xanchor": "left", "y": 1.03, "font": {"size": 11}},
+            meta={"chart_title": title},
+        )
+        x_config = deepcopy(layout[axis_key])
+        for key in ("matches", "domain", "anchor", "showticklabels"):
+            x_config.pop(key, None)
+        x_config.update(
+            title=x_title, anchor="y", domain=[0, 1], showticklabels=True,
+            rangeslider={"visible": True, "thickness": 0.13, "bgcolor": "#0b1220", "bordercolor": "#334155", "borderwidth": 1},
+        )
+        chart.update_layout(xaxis=x_config)
+        for old_ref, new_ref in mapping.items():
+            config = deepcopy(layout.get("yaxis" + old_ref[1:], {}))
+            for key in ("matches", "anchor", "overlaying", "domain"):
+                config.pop(key, None)
+            config.update(anchor="x", fixedrange=False)
+            if new_ref == "y":
+                config["domain"] = [0, 1]
+            else:
+                config.update(overlaying="y", side="right")
+            chart.update_layout(**{"yaxis" + new_ref[1:]: config})
+        for original in layout.get("shapes", []):
+            shape = deepcopy(original)
+            sx, sy = shape.get("xref", "x"), shape.get("yref", "y")
+            # A dashboard-wide warning uses x/paper; repeat it in every row.
+            if sy == "paper" and sx == "x" and shape.get("type") == "rect":
+                shape.update(xref="x", yref="paper", y0=0, y1=1)
+            elif sy.split()[0] in mapping and sx.split()[0] == x_ref:
+                shape["xref"] = sx.replace(x_ref, "x", 1)
+                shape["yref"] = sy.replace(sy.split()[0], mapping[sy.split()[0]], 1)
+            else:
+                continue
+            chart.add_shape(shape)
+        for original in layout.get("annotations", []):
+            sy = original.get("yref", "y")
+            sx = original.get("xref", "x")
+            if sy in mapping and sx.split()[0] == x_ref:
+                annotation = deepcopy(original)
+                annotation.update(yref=mapping[sy], xref=sx.replace(x_ref, "x", 1))
+                chart.add_annotation(annotation)
+        if not traces:
+            chart.add_annotation(text="Нет измерений", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        charts.append(chart)
+    return charts
