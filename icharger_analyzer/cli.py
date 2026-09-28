@@ -73,6 +73,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cdn", action="store_true", help="Подключать Plotly из CDN вместо автономного HTML")
     parser.add_argument("--no-csv", action="store_true", help="Не экспортировать декодированные CSV")
     parser.add_argument(
+        "--energy-voltage", choices=("auto", "cells", "output"), default="auto",
+        help="Источник напряжения для Wh: auto — полная сумма банок, иначе силовой выход; cells или output — вручную.",
+    )
+    parser.add_argument(
         "--comparison-step",
         type=float,
         default=None,
@@ -107,7 +111,7 @@ def run(argv: list[str] | None = None) -> int:
         print(f"[{number}/{len(inputs)}] {path}")
         try:
             log = parser.parse(path)
-            result = analyze_log(log)
+            result = analyze_log(log, energy_voltage=args.energy_voltage)
             stem = _safe_stem(path)
             report_name = f"{stem}_report.html"
             time_figure = create_time_dashboard(result.telemetry, result.status, result.warnings)
@@ -140,6 +144,16 @@ def run(argv: list[str] | None = None) -> int:
                     "comparison_step_s": "",
                     "capacity_ah": summary.capacity_counter_ah,
                     "energy_wh": summary.integrated_energy_wh,
+                    "battery_energy_wh": summary.battery_energy_wh,
+                    "discharge_energy_wh": summary.discharge_energy_wh,
+                    "charge_energy_wh": summary.charge_energy_wh,
+                    "output_discharge_energy_wh": summary.output_discharge_energy_wh,
+                    "output_charge_energy_wh": summary.output_charge_energy_wh,
+                    "energy_difference_wh": summary.energy_difference_wh,
+                    "discharge_capacity_ah": summary.discharge_capacity_ah,
+                    "charge_capacity_ah": summary.charge_capacity_ah,
+                    "battery_energy_source": summary.battery_energy_source,
+                    "integration_omitted_s": summary.integration_omitted_s,
                     "end_voltage_v": summary.end_pack_voltage_v,
                     "min_cell_v": min_cell_text,
                     "parse_issues": summary.parse_issue_count,
@@ -148,7 +162,9 @@ def run(argv: list[str] | None = None) -> int:
             comparison_series.append((path.stem, result.telemetry))
             print(
                 f"    OK: {summary.samples} samples, {summary.duration_s / 3600:.2f} h, "
-                f"{summary.capacity_counter_ah:.3f} Ah -> {output_dir / report_name}"
+                f"{summary.capacity_counter_ah:.3f} Ah, "
+                f"discharge {summary.discharge_energy_wh:.2f} Wh / charge {summary.charge_energy_wh:.2f} Wh "
+                f"({summary.battery_energy_source}) -> {output_dir / report_name}"
             )
         except Exception as exc:  # CLI boundary: continue with remaining files.
             failures += 1

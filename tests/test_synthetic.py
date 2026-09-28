@@ -4,13 +4,26 @@ from icharger_analyzer.analytics import analyze_log
 from icharger_analyzer.parser import IChargerParser
 
 
+def _checksummed(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        if line.startswith("$") and ";" in line:
+            body = line[:line.rfind(";") + 1]
+            checksum = 0
+            for byte in body.encode("ascii"):
+                checksum ^= byte
+            line = body + str(checksum)
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
 def test_decode_packet_and_skip_broken_line(tmp_path: Path) -> None:
     sample = tmp_path / "sample.txt"
     sample.write_text(
-        "@Model:4010DUO; Fireware:V2.20; Hardware:V2.00; SN:ABC\x00\n"
+        _checksummed("@Model:4010DUO; Fireware:V2.20; Hardware:V2.00; SN:ABC\x00\n"
         "$1;2;0;1;0;-500;24300;21000;0;350;0;4200;4200;4200;4200;4200;0;0;0;0;0;1\n"
         "$broken\n"
-        "$1;2;1000;1;0;-500;24300;20950;-1;351;0;4190;4190;4190;4190;4190;0;0;0;0;0;1\n",
+        "$1;2;1000;1;0;-500;24300;20950;-1;351;0;4190;4190;4190;4190;4190;0;0;0;0;0;1\n"),
         encoding="utf-8",
     )
     log = IChargerParser().parse(sample)
@@ -26,10 +39,10 @@ def test_decode_packet_and_skip_broken_line(tmp_path: Path) -> None:
 def test_time_columns_and_sampling_summary(tmp_path: Path) -> None:
     sample = tmp_path / "timing.txt"
     sample.write_text(
-        "@Model:4010DUO; Fireware:V2.20; Hardware:V2.00; SN:ABC\n"
+        _checksummed("@Model:4010DUO; Fireware:V2.20; Hardware:V2.00; SN:ABC\n"
         "$1;2;0;1;0;-100;12000;4200;0;250;0;4200;0;0;0;0;0;0;0;0;0;1\n"
         "$1;2;1000;1;0;-100;12000;4190;-1;250;0;4190;0;0;0;0;0;0;0;0;0;1\n"
-        "$1;2;2000;1;0;-100;12000;4180;-2;250;0;4180;0;0;0;0;0;0;0;0;0;1\n",
+        "$1;2;2000;1;0;-100;12000;4180;-2;250;0;4180;0;0;0;0;0;0;0;0;0;1\n"),
         encoding="utf-8",
     )
     result = analyze_log(IChargerParser().parse(sample))

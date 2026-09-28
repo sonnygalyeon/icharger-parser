@@ -16,10 +16,7 @@ from icharger_analyzer.parser import IChargerParser
     ],
 )
 def test_supplied_logs(filename: str, cells: int, expected_start_v: float) -> None:
-    root = Path(__file__).resolve().parents[2]
-    source = root / filename
-    if not source.exists():
-        pytest.skip(f"Test fixture not copied next to project: {source}")
+    source = Path(__file__).resolve().parents[1] / "examples" / filename
     log = IChargerParser().parse(source)
     result = analyze_log(log)
     assert result.summary.samples > 1000

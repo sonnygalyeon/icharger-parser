@@ -1,4 +1,4 @@
-"""Self-contained HTML report generation."""
+"""Compact, self-contained HTML reports with independent chart navigation."""
 
 from __future__ import annotations
 
@@ -6,12 +6,14 @@ import html
 import json
 from pathlib import Path
 
-import pandas as pd
 import plotly.graph_objects as go
+from plotly.offline import get_plotlyjs, get_plotlyjs_version
 
 from .analytics import AnalysisResult, AnalysisWarning
-from .charts import PLOTLY_CONFIG
+from .charts import PLOTLY_CONFIG, independent_charts
 from .models import ChargerLog
+
+ASSETS = Path(__file__).with_name("assets")
 
 
 def _fmt(value: object, digits: int = 2, suffix: str = "") -> str:
@@ -23,10 +25,13 @@ def _fmt(value: object, digits: int = 2, suffix: str = "") -> str:
 
 
 def _duration(seconds: float) -> str:
-    seconds_int = int(round(seconds))
-    hours, remainder = divmod(seconds_int, 3600)
+    hours, remainder = divmod(int(round(seconds)), 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _rows(items: dict[str, object]) -> str:
+    return "".join(f"<tr><th>{html.escape(key)}</th><td>{html.escape(str(value))}</td></tr>" for key, value in items.items())
 
 
 def _warning_rows(warnings: list[AnalysisWarning]) -> str:
@@ -37,14 +42,9 @@ def _warning_rows(warnings: list[AnalysisWarning]) -> str:
         severity = {"high": "Высокая", "medium": "Средняя", "low": "Низкая"}.get(warning.severity, warning.severity)
         peak = "—" if warning.peak_value is None else f"{warning.peak_value:.3f} {html.escape(warning.unit)}"
         rows.append(
-            "<tr>"
-            f'<td><span class="badge {html.escape(warning.severity)}">{severity}</span></td>'
-            f"<td>{html.escape(warning.title)}</td>"
-            f"<td>{warning.start_s:.1f}</td>"
-            f"<td>{warning.end_s:.1f}</td>"
-            f"<td>{peak}</td>"
-            f"<td>{html.escape(warning.description)}</td>"
-            "</tr>"
+            f'<tr><td><span class="badge {html.escape(warning.severity)}">{html.escape(severity)}</span></td>'
+            f"<td>{html.escape(warning.title)}</td><td>{_duration(warning.start_s)}</td><td>{_duration(warning.end_s)}</td>"
+            f"<td>{peak}</td><td>{html.escape(warning.description)}</td></tr>"
         )
     return "".join(rows)
 
@@ -52,227 +52,154 @@ def _warning_rows(warnings: list[AnalysisWarning]) -> str:
 def _issue_rows(log: ChargerLog) -> str:
     if not log.issues:
         return '<tr><td colspan="3" class="muted">Повреждённых строк не найдено.</td></tr>'
-    rows = []
-    for issue in log.issues[:200]:
-        rows.append(
-            "<tr>"
-            f"<td>{issue.line_number}</td>"
-            f"<td>{html.escape(issue.message)}</td>"
-            f"<td><code>{html.escape(issue.line)}</code></td>"
-            "</tr>"
-        )
-    return "".join(rows)
-
-
-def _figure_html(fig: go.Figure, *, include_plotlyjs: bool | str) -> str:
-    return fig.to_html(
-        full_html=False,
-        include_plotlyjs=include_plotlyjs,
-        config=PLOTLY_CONFIG,
-        div_id=None,
+    return "".join(
+        f"<tr><td>{issue.line_number}</td><td>{html.escape(issue.message)}</td><td><code>{html.escape(issue.line)}</code></td></tr>"
+        for issue in log.issues[:200]
     )
 
 
-def write_report(
-    log: ChargerLog,
-    result: AnalysisResult,
-    figures: list[go.Figure],
-    output_file: Path,
-    *,
-    standalone: bool = True,
-) -> None:
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    summary = result.summary
-    include_js: bool | str = True if standalone else "cdn"
-    graph_html = []
-    for index, figure in enumerate(figures):
-        graph_html.append(_figure_html(figure, include_plotlyjs=include_js if index == 0 else False))
+def _chart_sections(figures: list[tuple[str, str, go.Figure]]) -> tuple[str, str]:
+    cards, options = [], []
+    for group, description, dashboard in figures:
+        for chart in independent_charts(dashboard):
+            index = len(cards)
+            title = str(chart.layout.meta["chart_title"])
+            chart_id = f"chart-{index}"
+            options.append(f'<option value="{index}">{index + 1:02d} · {html.escape(group)} / {html.escape(title)}</option>')
+            # Escape '<' in JSON to keep filenames and trace labels out of HTML parsing.
+            payload = chart.to_json().replace("<", "\\u003c").replace("&", "\\u0026")
+            cards.append(f'''<section class="card chart-card" id="{chart_id}" aria-labelledby="{chart_id}-title">
+<div class="chart-top"><h2 id="{chart_id}-title"><span class="chart-number">{index + 1:02d}</span>{html.escape(title)}</h2><span class="chart-unit">{html.escape(group)}</span></div>
+<p class="chart-description">{html.escape(description)}</p>
+<div class="chart-tools" role="group" aria-label="Управление графиком {index + 1}">
+<button type="button" data-action="left" title="Сдвинуть интервал влево" aria-label="Сдвинуть влево">←</button>
+<button type="button" data-action="right" title="Сдвинуть интервал вправо" aria-label="Сдвинуть вправо">→</button>
+<button type="button" data-action="zoom-in" title="Приблизить по горизонтали">X +</button>
+<button type="button" data-action="zoom-out" title="Отдалить по горизонтали">X −</button>
+<button type="button" data-action="y-in" title="Приблизить по вертикали">Y +</button>
+<button type="button" data-action="y-out" title="Отдалить по вертикали">Y −</button>
+<button type="button" data-action="fit-y" title="Подобрать вертикальный масштаб по видимому участку">Авто Y</button>
+<button type="button" data-action="box" aria-pressed="false" title="Выделить прямоугольник мышью для увеличения">Выделение</button>
+<button type="button" data-action="reset">Сброс</button><span class="spacer"></span>
+<button type="button" data-action="export" title="Сохранить этот график как PNG">PNG</button>
+<button type="button" data-action="expand" aria-expanded="false">Развернуть</button>
+</div>
+<div class="plot-host" id="plot-{index}"></div><script type="application/json" class="plot-data">{payload}</script>
+<div class="chart-range">
+<label class="slider-label">Масштаб <input type="range" min="0" max="1000" value="0" step="1" data-control="zoom" aria-label="Масштаб графика {index + 1}"></label>
+<label class="slider-label">Позиция <input type="range" min="0" max="1000" value="0" step="1" data-control="position" aria-label="Позиция графика {index + 1}"></label>
+<output class="range-text" aria-label="Видимый диапазон"></output>
+</div></section>''')
+    nav = f'''<nav class="chart-nav" aria-label="Переход между графиками">
+<button type="button" id="chart-prev" aria-label="Предыдущий график">↑</button>
+<select id="chart-select" aria-label="Выбрать график">{''.join(options)}</select>
+<button type="button" id="chart-next" aria-label="Следующий график">↓</button>
+<span class="help">Перетаскивайте график · меняйте границы в нижнем обзоре · Esc — свернуть</span></nav>'''
+    return nav, "".join(cards)
 
+
+def _document(title: str, body: str, *, standalone: bool) -> str:
+    bundle = f"<script>{get_plotlyjs()}</script>" if standalone else f'<script src="https://cdn.plot.ly/plotly-{get_plotlyjs_version()}.min.js"></script>'
+    return f'''<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title)}</title><style>{ASSETS.joinpath('report.css').read_text(encoding='utf-8')}</style>
+{bundle}</head><body><main>{body}<p class="footer">iCharger Analyzer · исходные точки сохранены · Ah — заряд, Wh — энергия</p></main>
+<script id="plot-config" type="application/json">{json.dumps(PLOTLY_CONFIG)}</script>
+<script>{ASSETS.joinpath('report.js').read_text(encoding='utf-8')}</script>
+<noscript>Для интерактивных графиков включите JavaScript. Числовая сводка доступна выше.</noscript></body></html>'''
+
+
+def write_report(log: ChargerLog, result: AnalysisResult, figures: list[go.Figure], output_file: Path, *, standalone: bool = True) -> None:
+    s = result.summary
+    source = "по сумме банок" if s.battery_energy_source == "cells" else "по силовому выходу"
+    discharge = s.discharge_capacity_ah > 0
+    charged = s.charge_capacity_ah > 0
+    energy = s.discharge_energy_wh if discharge else s.charge_energy_wh
+    output_energy = s.output_discharge_energy_wh if discharge else s.output_charge_energy_wh
+    label = "Отдано батареей" if discharge else "Принято батареей"
+    mode = "Заряд + разряд" if discharge and charged else "Разряд" if discharge else "Заряд" if charged else "Покой"
     kpis = [
-        ("Длительность", _duration(summary.duration_s)),
-        ("Отсчёты", f"{summary.samples:,}".replace(",", " ")),
-        ("Период записи", _fmt(summary.median_sample_interval_s, 3, " s")),
-        ("Частота записи", _fmt(summary.nominal_sample_rate_hz, 3, " Hz")),
-        ("Разрывы телеметрии", str(summary.telemetry_gap_count)),
-        ("Банки", str(summary.detected_cells)),
-        ("Ёмкость по счётчику", _fmt(summary.capacity_counter_ah, 3, " Ah")),
-        ("Интеграл тока", _fmt(summary.integrated_capacity_ah, 3, " Ah")),
-        ("Энергия", _fmt(summary.integrated_energy_wh, 2, " Wh")),
-        ("Стартовое напряжение", _fmt(summary.start_pack_voltage_v, 3, " V")),
-        ("Конечное напряжение", _fmt(summary.end_pack_voltage_v, 3, " V")),
-        ("Пиковый ток разряда", _fmt(summary.peak_discharge_current_a, 2, " A")),
-        ("Пиковая мощность", _fmt(summary.peak_abs_power_w, 1, " W")),
-        ("Минимальная банка", _fmt(summary.min_cell_voltage_v, 3, " V")),
-        ("Максимальный Δ банок", _fmt(None if summary.max_cell_delta_v is None else summary.max_cell_delta_v * 1000, 1, " mV")),
-        ("Макс. внутренняя температура", _fmt(summary.max_internal_temp_c, 1, " °C")),
-        ("Последнее полное IR", _fmt(summary.latest_total_ir_mohm, 1, " mΩ")),
+        (label, _fmt(energy, 2, " Wh"), source, "primary"),
+        ("Ёмкость по счётчику", _fmt(s.capacity_counter_ah, 3, " Ah"), f"Интеграл |I|: {s.integrated_capacity_ah:.3f} Ah", ""),
+        ("Энергия силового выхода", _fmt(output_energy, 2, " Wh"), "разряд" if discharge else "заряд", ""),
+        ("Длительность", _duration(s.duration_s), f"{s.samples:,} отсчётов · {s.nominal_sample_rate_hz:g} Hz".replace(",", " "), ""),
     ]
     kpi_html = "".join(
-        f'<div class="kpi"><div class="kpi-label">{html.escape(label)}</div><div class="kpi-value">{html.escape(value)}</div></div>'
-        for label, value in kpis
+        f'<div class="kpi {cls}"><div class="kpi-label">{html.escape(label)}</div><div class="kpi-value">{html.escape(value)}</div><div class="kpi-note">{html.escape(note)}</div></div>'
+        for label, value, note, cls in kpis
     )
-
+    cell_label = f"{s.detected_cells}S по балансиру" if s.detected_cells else "Балансир не записан"
     metadata = {
-        "Модель": log.header.model or "—",
-        "Прошивка": log.header.firmware or "—",
+        "Модель / прошивка": f"{log.header.model or '—'} / {log.header.firmware or '—'}",
         "Аппаратная версия": log.header.hardware or "—",
         "Серийный номер": log.header.serial_number or "—",
-        "Канал": str(log.telemetry[0].channel),
-        "Код типа батареи": str(log.telemetry[0].battery_type_code),
-        "Медианный период": f"{summary.median_sample_interval_s:.3f} s",
-        "Средний период": f"{summary.mean_sample_interval_s:.3f} s",
-        "Минимальный период": f"{summary.min_sample_interval_s:.3f} s",
-        "Максимальный период / разрыв": f"{summary.max_sample_interval_s:.3f} s",
-        "СКО периода": f"{summary.sample_interval_std_s:.3f} s",
-        "Номинальная частота": f"{summary.nominal_sample_rate_hz:.3f} Hz",
-        "Обнаружено разрывов": str(summary.telemetry_gap_count),
-        "Пакетов 128": str(summary.status_record_count),
+        "Канал / код батареи": f"{log.telemetry[0].channel} / {log.telemetry[0].battery_type_code}",
+        "Интервал: медиана / min / max": f"{s.median_sample_interval_s:g} / {s.min_sample_interval_s:g} / {s.max_sample_interval_s:g} s",
+        "Интервал: среднее / СКО": f"{s.mean_sample_interval_s:.3f} / {s.sample_interval_std_s:.3f} s",
+        "Разрывы / повторы времени": f"{s.telemetry_gap_count} / {s.duplicate_timestamp_count}",
+        "Исключено из интеграла": f"{s.integration_omitted_s:g} s",
+        "Пакетов 128": s.status_record_count,
+        "Максимальная мощность выхода": _fmt(s.peak_abs_power_w, 2, " W"),
+        "Макс. внутренняя / внешняя температура": f"{_fmt(s.max_internal_temp_c, 1)} / {_fmt(s.max_external_temp_c, 1)} °C",
+        "Последнее полное IR (оценка)": _fmt(s.latest_total_ir_mohm, 1, " mΩ"),
     }
-    metadata_rows = "".join(
-        f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>" for key, value in metadata.items()
-    )
-
-    machine_summary = html.escape(json.dumps(summary.as_dict(), ensure_ascii=False, indent=2))
-    source_name = html.escape(log.source_file.name)
-    document = f"""<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>iCharger — {source_name}</title>
-<style>
-:root {{ color-scheme: dark; --bg:#0b1220; --card:#111827; --line:#334155; --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; }}
-* {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,Segoe UI,Arial,sans-serif; }}
-.container {{ width:min(1600px,96vw); margin:0 auto; padding:28px 0 60px; }}
-h1 {{ margin:0 0 6px; font-size:clamp(26px,4vw,44px); }}
-h2 {{ margin:0 0 16px; }}
-.subtitle,.muted {{ color:var(--muted); }}
-.card {{ background:var(--card); border:1px solid #1e293b; border-radius:16px; padding:20px; margin-top:20px; box-shadow:0 14px 40px rgba(0,0,0,.2); }}
-.kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin-top:20px; }}
-.kpi {{ background:#0f172a; border:1px solid #243244; border-radius:12px; padding:14px; }}
-.kpi-label {{ color:var(--muted); font-size:13px; }}
-.kpi-value {{ margin-top:7px; font-size:22px; font-weight:700; }}
-table {{ width:100%; border-collapse:collapse; }}
-th,td {{ border-bottom:1px solid #243244; text-align:left; padding:10px; vertical-align:top; }}
-th {{ color:#cbd5e1; }}
-.table-wrap {{ overflow:auto; }}
-.badge {{ display:inline-block; border-radius:999px; padding:4px 9px; font-size:12px; font-weight:700; }}
-.badge.high {{ background:#7f1d1d; color:#fecaca; }}
-.badge.medium {{ background:#78350f; color:#fde68a; }}
-.badge.low {{ background:#164e63; color:#cffafe; }}
-code,pre {{ font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }}
-pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:#0f172a; padding:14px; border-radius:10px; color:#cbd5e1; }}
-.note {{ border-left:4px solid var(--accent); padding:10px 14px; background:#0f172a; color:#cbd5e1; }}
-.graph {{ overflow:hidden; }}
-</style>
-</head>
-<body>
-<main class="container">
-<header>
-<h1>iCharger Analyzer</h1>
-<div class="subtitle">Источник: {source_name}</div>
-</header>
+    energy_rows = _rows({
+        "Батарея: отдано / принято": f"{s.discharge_energy_wh:.3f} / {s.charge_energy_wh:.3f} Wh",
+        "Силовой выход: отдано / принято": f"{s.output_discharge_energy_wh:.3f} / {s.output_charge_energy_wh:.3f} Wh",
+        "Интеграл тока: разряд / заряд": f"{s.discharge_capacity_ah:.4f} / {s.charge_capacity_ah:.4f} Ah",
+        "Разница энергий при разряде": f"{s.energy_difference_wh:.3f} Wh",
+        "Батарея: начало → конец": f"{s.start_battery_voltage_v:.3f} → {s.end_battery_voltage_v:.3f} V",
+        "Силовой выход: начало → конец": f"{s.start_pack_voltage_v:.3f} → {s.end_pack_voltage_v:.3f} V",
+    })
+    limitation = ""
+    if s.integration_omitted_s:
+        limitation += f'<p class="note warn">В расчёт Wh и интеграл Ah не вошли разрывы суммарно {s.integration_omitted_s:g} s. Показана энергия только покрытых данными участков.</p>'
+    if s.battery_energy_source == "output":
+        limitation += f'<p class="note">{html.escape(s.battery_energy_source_note)} Энергия на самой батарее без балансирного измерения отдельно не определяется.</p>'
+    if discharge and charged:
+        limitation += f'<p class="note">Смешанный цикл: отдано {s.discharge_energy_wh:.2f} Wh, принято {s.charge_energy_wh:.2f} Wh. Счётчик Ah показывает изменение от первой строки; интегралы направлений приведены отдельно.</p>'
+    nav, charts = _chart_sections([
+        ("По времени" if i == 0 else "По ёмкости", "Масштаб, диапазон и легенда действуют только на этот график.", fig)
+        for i, fig in enumerate(figures)
+    ])
+    name = html.escape(log.source_file.name)
+    machine_summary = html.escape(json.dumps(s.as_dict(), ensure_ascii=False, indent=2))
+    body = f'''<header><div class="eyebrow">Battery lab / iCharger</div><div class="header-row"><h1>Энергия и ёмкость батареи</h1><span class="pill">{mode} · {html.escape(cell_label)}</span></div><p class="subtitle">{name}</p></header>
 <section class="kpis">{kpi_html}</section>
-<section class="card">
-<h2>Параметры лога</h2>
-<div class="table-wrap"><table>{metadata_rows}</table></div>
-<p class="note">Каждый исходный отсчёт сохраняется в CSV с абсолютным счётчиком <code>timestamp_ms</code>, временем от начала <code>elapsed_time</code>, периодом <code>dt_s</code> и мгновенной частотой <code>sample_rate_hz</code>. Последний ряд временного графика показывает стабильность записи и разрывы.</p>
-<p class="note">Поля пакета 128 не опубликованы производителем. Внутреннее сопротивление показано по структуре ваших файлов и проверке суммы банков; исходные значения не теряются в парсере.</p>
-</section>
-<section class="card graph">{''.join(graph_html)}</section>
-<section class="card">
-<h2>Сгруппированные предупреждения</h2>
-<div class="table-wrap"><table><thead><tr><th>Уровень</th><th>Событие</th><th>Начало, s</th><th>Конец, s</th><th>Пик</th><th>Описание</th></tr></thead><tbody>{_warning_rows(result.warnings)}</tbody></table></div>
-</section>
-<section class="card">
-<h2>Качество исходного файла</h2>
-<p>Корректных телеметрических пакетов: <b>{summary.samples}</b>. Повреждённых строк: <b>{len(log.issues)}</b>. Неподдерживаемые типы: <b>{html.escape(str(log.unsupported_packet_counts) or 'нет')}</b>.</p>
-<div class="table-wrap"><table><thead><tr><th>Строка</th><th>Ошибка</th><th>Фрагмент</th></tr></thead><tbody>{_issue_rows(log)}</tbody></table></div>
-</section>
-<details class="card"><summary>Машиночитаемая сводка JSON</summary><pre>{machine_summary}</pre></details>
-</main>
-</body>
-</html>"""
-    output_file.write_text(document, encoding="utf-8")
-
-
-def write_comparison_report(
-    rows: list[dict[str, object]],
-    figures: list[tuple[str, str, go.Figure]],
-    output_file: Path,
-    *,
-    comparison_step_s: float,
-    standalone: bool = True,
-) -> None:
-    """Write the final multi-log dashboard with several overlaid figures."""
-
+<div class="facts"><span>Батарея <b>{s.start_battery_voltage_v:.3f} → {s.end_battery_voltage_v:.3f} V</b></span><span>Пик разряда <b>{s.peak_discharge_current_a:.2f} A</b></span><span>Мин. банка <b>{_fmt(s.min_cell_voltage_v, 3, ' V')}</b></span><span>Разрывы <b>{s.telemetry_gap_count}</b></span><span>Ошибки строк <b>{len(log.issues)}</b></span></div>
+{limitation}
+<details class="card"><summary>Расчёт Wh и источники напряжения</summary><div class="detail-grid"><div><div class="table-wrap"><table>{energy_rows}</table></div></div><div>
+<p>{html.escape(s.battery_energy_source_note)}</p>
+<p class="formula">Pᵢ = Uᵢ × Iᵢ<br>E = Σ (Pᵢ₋₁ + Pᵢ) / 2 × Δtᵢ / 3600</p>
+<p class="muted">U — в вольтах, I — в амперах, Δt — в секундах. Заряд и разряд интегрируются отдельно, с разделением интервала при смене знака тока. Используются все исходные отсчёты.</p>
+<p class="note">Wh — энергия за записанный участок испытания. Полную доступную энергию можно оценить по полному разряду при заданных условиях. Умножение Ah на начальное напряжение не учитывает изменение напряжения.</p>
+<p class="note">Разница напряжений и энергий может включать падение на проводах и контактах, а также погрешность измерений. Балансирные каналы должны охватывать все последовательные банки батареи.</p>
+</div></div></details>
+<details class="card"><summary>Устройство и качество записи</summary><div class="table-wrap"><table>{_rows(metadata)}</table></div><p class="note">Масштаб сопротивления пакета 128 принят по структуре файлов и сумме полей; это оценка. Сырые поля сохраняются парсером.</p></details>
+<div class="section-heading"><h2>Графики</h2><span class="help">Независимое управление</span></div>{nav}{charts}
+<details class="card"><summary>События и предупреждения · {len(result.warnings)}</summary><div class="table-wrap"><table><thead><tr><th>Уровень</th><th>Событие</th><th>Начало</th><th>Конец</th><th>Пик</th><th>Описание</th></tr></thead><tbody>{_warning_rows(result.warnings)}</tbody></table></div></details>
+<details class="card"><summary>Ошибки разбора · {len(log.issues)}</summary><p class="muted">Телеметрия: {s.samples}. Неподдерживаемые пакеты: {html.escape(str(log.unsupported_packet_counts) if log.unsupported_packet_counts else 'нет')}. Показаны первые 200 ошибок.</p><div class="table-wrap"><table><thead><tr><th>Строка</th><th>Ошибка</th><th>Фрагмент</th></tr></thead><tbody>{_issue_rows(log)}</tbody></table></div></details>
+<details class="card"><summary>Сводка JSON</summary><pre>{machine_summary}</pre></details>'''
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(_document(f"iCharger — {log.source_file.name}", body, standalone=standalone), encoding="utf-8")
+
+
+def write_comparison_report(rows: list[dict[str, object]], figures: list[tuple[str, str, go.Figure]], output_file: Path, *, comparison_step_s: float, standalone: bool = True) -> None:
     table_rows = "".join(
-        "<tr>"
-        f"<td><a href=\"{html.escape(str(row['report']))}\">{html.escape(str(row['file']))}</a></td>"
-        f"<td>{html.escape(str(row['cells']))}</td>"
-        f"<td>{float(row['duration_h']):.2f}</td>"
-        f"<td>{float(row['samples']):.0f}</td>"
-        f"<td>{float(row['median_interval_s']):.3f}</td>"
-        f"<td>{float(row['min_interval_s']):.3f}</td>"
-        f"<td>{float(row['max_interval_s']):.3f}</td>"
-        f"<td>{int(row['gap_count'])}</td>"
-        f"<td>{float(row['capacity_ah']):.3f}</td>"
-        f"<td>{float(row['energy_wh']):.2f}</td>"
-        f"<td>{float(row['end_voltage_v']):.3f}</td>"
-        f"<td>{html.escape(str(row['min_cell_v']))}</td>"
-        "</tr>"
+        '<tr>'
+        f'<td><a href="{html.escape(str(row["report"]), quote=True)}">{html.escape(str(row["file"]))}</a></td>'
+        f'<td>{row["cells"]}</td><td>{float(row["duration_h"]):.2f}</td>'
+        f'<td>{float(row["capacity_ah"]):.3f}</td><td>{float(row["discharge_energy_wh"]):.2f}</td>'
+        f'<td>{float(row["charge_energy_wh"]):.2f}</td><td>{float(row["energy_wh"]):.2f}</td>'
+        f'<td>{"Банки" if row["battery_energy_source"] == "cells" else "Силовой выход"}</td>'
+        f'<td>{float(row["integration_omitted_s"]):g}</td><td>{float(row["median_interval_s"]):g}</td>'
+        f'<td>{int(row["gap_count"])}</td><td>{html.escape(str(row["min_cell_v"]))}</td></tr>'
         for row in rows
     )
-
-    figure_html: list[str] = []
-    include_js: bool | str = True if standalone else "cdn"
-    for index, (title, description, figure) in enumerate(figures):
-        graph = _figure_html(figure, include_plotlyjs=include_js if index == 0 else False)
-        figure_html.append(
-            f'<section class="card graph"><h2>{html.escape(title)}</h2>'
-            f'<p class="muted">{html.escape(description)}</p>{graph}</section>'
-        )
-
-    document = f"""<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>iCharger — общее сравнение</title>
-<style>
-:root {{ color-scheme:dark; --bg:#0b1220; --card:#111827; --line:#334155; --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; }}
-* {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,Segoe UI,Arial,sans-serif; }}
-main {{ width:min(1800px,97vw); margin:auto; padding:30px 0 70px; }}
-h1 {{ margin:0 0 8px; font-size:clamp(28px,4vw,46px); }}
-h2 {{ margin:0 0 8px; }}
-a {{ color:var(--accent); }}
-.muted {{ color:var(--muted); }}
-.card {{ background:var(--card); border:1px solid #1e293b; border-radius:16px; padding:20px; margin-top:20px; box-shadow:0 14px 40px rgba(0,0,0,.2); }}
-.note {{ border-left:4px solid var(--accent); padding:11px 14px; background:#0f172a; color:#cbd5e1; }}
-.table-wrap {{ overflow:auto; }}
-table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
-th,td {{ padding:10px; border-bottom:1px solid var(--line); text-align:left; }}
-th {{ position:sticky; top:0; background:#111827; color:#cbd5e1; }}
-.graph {{ overflow:hidden; }}
-code {{ font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }}
-</style>
-</head>
-<body>
-<main>
-<header>
-<h1>Общее сравнение логов iCharger</h1>
-<p class="muted">Все испытания наложены друг на друга отдельными линиями. Щелчок по имени файла в легенде скрывает или показывает эту линию сразу на связанных графиках.</p>
-</header>
-<section class="card">
-<h2>Временная сетка</h2>
-<p class="note">Исходные отчёты используют каждый записанный отсчёт. Только общий сравнительный график интерполируется на единую сетку с периодом <b>{comparison_step_s:g} s</b>, чтобы логи с разной частотой записи можно было корректно накладывать и чтобы HTML оставался отзывчивым.</p>
-<div class="table-wrap"><table><thead><tr><th>Файл</th><th>Банки</th><th>Часы</th><th>Отсчёты</th><th>Медиана, s</th><th>Min, s</th><th>Max, s</th><th>Разрывы</th><th>Ah</th><th>Wh</th><th>Конец, V</th><th>Min cell</th></tr></thead><tbody>{table_rows}</tbody></table></div>
-</section>
-{''.join(figure_html)}
-</main>
-</body>
-</html>"""
-    output_file.write_text(document, encoding="utf-8")
+    nav, charts = _chart_sections(figures)
+    body = f'''<header><div class="eyebrow">Battery lab / iCharger</div><h1>Сравнение испытаний</h1><p class="subtitle">{len(rows)} логов · отдельная линия для каждого файла · общий шаг {comparison_step_s:g} s</p></header>
+<section class="card"><h2>Результаты</h2><div class="table-wrap"><table class="summary-table"><thead><tr><th>Файл</th><th>Банки</th><th>Часы</th><th>Счётчик, Ah</th><th>Отдано, Wh</th><th>Принято, Wh</th><th>Выход ∑, Wh</th><th>Источник U</th><th>Пропущено, s</th><th>Период, s</th><th>Разрывы</th><th>Min cell, V</th></tr></thead><tbody>{table_rows}</tbody></table></div></section>
+<details class="card"><summary>Как читать сравнение</summary><p class="note">Итоги посчитаны по исходным отсчётам. Только сравнительные линии интерполированы на сетку {comparison_step_s:g} s. Отдельные отчёты сохраняют все точки. Нажмите на имя файла в легенде, чтобы скрыть или показать линию на выбранном графике.</p><p class="note">Источник U указан для каждого файла. Wh батареи по балансиру и по силовому выходу относятся к разным точкам измерения. «Выход ∑» — сумма энергии заряда и разряда на силовом выходе.</p></details>
+<div class="section-heading"><h2>Графики</h2><span class="help">Независимое управление</span></div>{nav}{charts}'''
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(_document("iCharger — сравнение испытаний", body, standalone=standalone), encoding="utf-8")
